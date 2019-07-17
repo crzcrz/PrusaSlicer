@@ -120,7 +120,7 @@ public:
     void clear_support_layers();
     SupportLayer* get_support_layer(int idx) { return m_support_layers[idx]; }
     SupportLayer* add_support_layer(int id, coordf_t height, coordf_t print_z);
-    SupportLayerPtrs::const_iterator insert_support_layer(SupportLayerPtrs::const_iterator pos, int id, coordf_t height, coordf_t print_z, coordf_t slice_z);
+    SupportLayerPtrs::const_iterator insert_support_layer(SupportLayerPtrs::const_iterator pos, size_t id, coordf_t height, coordf_t print_z, coordf_t slice_z);
     void delete_support_layer(int idx);
     
     // Initialize the layer_height_profile from the model_object's layer_height_profile, from model_object's layer height table, or from slicing parameters.
@@ -216,7 +216,7 @@ struct WipeTowerData
     // Cache it here, so it does not need to be recalculated during the G-code generation.
     ToolOrdering                                          tool_ordering;
     // Cache of tool changes per print layer.
-    std::unique_ptr<WipeTower::ToolChangeResult>          priming;
+    std::unique_ptr<std::vector<WipeTower::ToolChangeResult>> priming;
     std::vector<std::vector<WipeTower::ToolChangeResult>> tool_changes;
     std::unique_ptr<WipeTower::ToolChangeResult>          final_purge;
     std::vector<float>                                    used_filament;
@@ -241,6 +241,8 @@ struct PrintStatistics
     PrintStatistics() { clear(); }
     std::string                     estimated_normal_print_time;
     std::string                     estimated_silent_print_time;
+    std::vector<std::string>        estimated_normal_color_print_times;
+    std::vector<std::string>        estimated_silent_color_print_times;
     double                          total_used_filament;
     double                          total_extruded_volume;
     double                          total_cost;
@@ -259,6 +261,8 @@ struct PrintStatistics
     void clear() {
         estimated_normal_print_time.clear();
         estimated_silent_print_time.clear();
+        estimated_normal_color_print_times.clear();
+        estimated_silent_color_print_times.clear();
         total_used_filament    = 0.;
         total_extruded_volume  = 0.;
         total_cost             = 0.;

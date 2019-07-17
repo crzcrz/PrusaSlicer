@@ -127,6 +127,8 @@ wxDECLARE_EVENT(EVT_GLCANVAS_TAB, SimpleEvent);
 wxDECLARE_EVENT(EVT_GLCANVAS_RESETGIZMOS, SimpleEvent);
 wxDECLARE_EVENT(EVT_GLCANVAS_MOVE_DOUBLE_SLIDER, wxKeyEvent);
 wxDECLARE_EVENT(EVT_GLCANVAS_EDIT_COLOR_CHANGE, wxKeyEvent);
+wxDECLARE_EVENT(EVT_GLCANVAS_UNDO, SimpleEvent);
+wxDECLARE_EVENT(EVT_GLCANVAS_REDO, SimpleEvent);
 
 class GLCanvas3D
 {
@@ -453,7 +455,6 @@ private:
     // Screen is only refreshed from the OnIdle handler if it is dirty.
     bool m_dirty;
     bool m_initialized;
-    bool m_use_VBOs;
     bool m_apply_zoom_to_volumes_filter;
     mutable std::vector<int> m_hover_volume_idxs;
     bool m_warning_texture_enabled;
@@ -486,6 +487,8 @@ private:
     RenderStats m_render_stats;
 #endif // ENABLE_RENDER_STATISTICS
 
+    int m_imgui_undo_redo_hovered_pos{ -1 };
+
 public:
     GLCanvas3D(wxGLCanvas* canvas, Bed3D& bed, Camera& camera, GLToolbar& view_toolbar);
     ~GLCanvas3D();
@@ -495,7 +498,7 @@ public:
     wxGLCanvas* get_wxglcanvas() { return m_canvas; }
 	const wxGLCanvas* get_wxglcanvas() const { return m_canvas; }
 
-    bool init(bool useVBOs);
+    bool init();
     void post_event(wxEvent &&event);
 
     void set_as_dirty();
@@ -513,6 +516,9 @@ public:
 
     const Selection& get_selection() const { return m_selection; }
     Selection& get_selection() { return m_selection; }
+
+    const GLGizmosManager& get_gizmos_manager() const { return m_gizmos; }
+    GLGizmosManager& get_gizmos_manager() { return m_gizmos; }
 
     void bed_shape_changed();
 
@@ -597,11 +603,12 @@ public:
 
     void set_tooltip(const std::string& tooltip) const;
 
-    void do_move();
-    void do_rotate();
-    void do_scale();
-    void do_flatten();
-    void do_mirror();
+    // the following methods add a snapshot to the undo/redo stack, unless the given string is empty
+    void do_move(const std::string& snapshot_type);
+    void do_rotate(const std::string& snapshot_type);
+    void do_scale(const std::string& snapshot_type);
+    void do_flatten(const Vec3d& normal, const std::string& snapshot_type);
+    void do_mirror(const std::string& snapshot_type);
 
     void set_camera_zoom(double zoom);
 
@@ -674,6 +681,7 @@ private:
 #endif // ENABLE_SHOW_CAMERA_TARGET
     void _render_sla_slices() const;
     void _render_selection_sidebar_hints() const;
+    void _render_undo_redo_stack(const bool is_undo, float pos_x);
 
     void _update_volumes_hover_state() const;
 
@@ -729,12 +737,10 @@ private:
 
     bool _is_any_volume_outside() const;
 
-#if !ENABLE_SVG_ICONS
-    void _resize_toolbars() const;
-#endif // !ENABLE_SVG_ICONS
-
     // updates the selection from the content of m_hover_volume_idxs
     void _update_selection_from_hover();
+
+    bool _deactivate_undo_redo_toolbar_items();
 
     static std::vector<float> _parse_colors(const std::vector<std::string>& colors);
 
