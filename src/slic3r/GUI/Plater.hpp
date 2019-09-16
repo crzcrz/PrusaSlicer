@@ -27,6 +27,11 @@ class ModelObject;
 class Print;
 class SLAPrint;
 
+namespace UndoRedo {
+	class Stack;
+	struct Snapshot;	
+};
+
 namespace GUI {
 
 class MainFrame;
@@ -142,14 +147,18 @@ public:
     void add_model();
     void extract_config_from_project();
 
-    void load_files(const std::vector<boost::filesystem::path>& input_files, bool load_model = true, bool load_config = true);
+    std::vector<size_t> load_files(const std::vector<boost::filesystem::path>& input_files, bool load_model = true, bool load_config = true);
     // To be called when providing a list of files to the GUI slic3r on command line.
-    void load_files(const std::vector<std::string>& input_files, bool load_model = true, bool load_config = true);
+    std::vector<size_t> load_files(const std::vector<std::string>& input_files, bool load_model = true, bool load_config = true);
 
     void update();
     void stop_jobs();
     void select_view(const std::string& direction);
     void select_view_3D(const std::string& name);
+
+    bool is_preview_shown() const;
+    bool is_preview_loaded() const;
+    bool is_view3D_shown() const;
 
     // Called after the Preferences dialog is closed and the program settings are saved.
     // Update the UI based on the current preferences.
@@ -174,8 +183,10 @@ public:
     void export_stl(bool extended = false, bool selection_only = false);
     void export_amf();
     void export_3mf(const boost::filesystem::path& output_path = boost::filesystem::path());
+    bool has_toolpaths_to_export() const;
+    void export_toolpaths_to_obj() const;
     void reslice();
-    void reslice_SLA_supports(const ModelObject &object);
+    void reslice_SLA_supports(const ModelObject &object, bool postpone_error_messages = false);
     void changed_object(int obj_idx);
     void changed_objects(const std::vector<size_t>& object_idxs);
     void schedule_background_process(bool schedule = true);
@@ -186,13 +197,17 @@ public:
 
     void take_snapshot(const std::string &snapshot_name);
     void take_snapshot(const wxString &snapshot_name);
-    void suppress_snapshots();
-    void allow_snapshots();
     void undo();
     void redo();
     void undo_to(int selection);
     void redo_to(int selection);
     bool undo_redo_string_getter(const bool is_undo, int idx, const char** out_text);
+    void undo_redo_topmost_string_getter(const bool is_undo, std::string& out_text);
+    // For the memory statistics. 
+    const Slic3r::UndoRedo::Stack& undo_redo_stack_main() const;
+    // Enter / leave the Gizmos specific Undo / Redo stack. To be used by the SLA support point editing gizmo.
+    void enter_gizmos_stack();
+    void leave_gizmos_stack();
 
     void on_extruders_change(int extruders_count);
     void on_config_change(const DynamicPrintConfig &config);
@@ -235,9 +250,45 @@ public:
 
     const Camera& get_camera() const;
 
+	// ROII wrapper for suppressing the Undo / Redo snapshot to be taken.
+	class SuppressSnapshots
+	{
+	public:
+		SuppressSnapshots(Plater *plater) : m_plater(plater)
+		{
+			m_plater->suppress_snapshots();
+		}
+		~SuppressSnapshots()
+		{
+			m_plater->allow_snapshots();
+		}
+	private:
+		Plater *m_plater;
+	};
+
+	// ROII wrapper for taking an Undo / Redo snapshot while disabling the snapshot taking by the methods called from inside this snapshot.
+	class TakeSnapshot
+	{
+	public:
+		TakeSnapshot(Plater *plater, const wxString &snapshot_name) : m_plater(plater)
+		{
+			m_plater->take_snapshot(snapshot_name);
+			m_plater->suppress_snapshots();
+		}
+		~TakeSnapshot()
+		{
+			m_plater->allow_snapshots();
+		}
+	private:
+		Plater *m_plater;
+	};
+
 private:
     struct priv;
     std::unique_ptr<priv> p;
+
+    void suppress_snapshots();
+    void allow_snapshots();
 
     friend class SuppressBackgroundProcessingUpdate;
 };

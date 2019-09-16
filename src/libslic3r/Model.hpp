@@ -10,12 +10,22 @@
 #include "Slicing.hpp"
 #include "SLA/SLACommon.hpp"
 #include "TriangleMesh.hpp"
+#include "Arrange.hpp"
 
 #include <map>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace cereal {
+	class BinaryInputArchive;
+	class BinaryOutputArchive;
+	template <class T> void load_optional(BinaryInputArchive &ar, std::shared_ptr<const T> &ptr);
+	template <class T> void save_optional(BinaryOutputArchive &ar, const std::shared_ptr<const T> &ptr);
+	template <class T> void load_by_value(BinaryInputArchive &ar, T &obj);
+	template <class T> void save_by_value(BinaryOutputArchive &ar, const T &obj);
+}
 
 namespace Slic3r {
 
@@ -24,6 +34,7 @@ class ModelInstance;
 class ModelMaterial;
 class ModelObject;
 class ModelVolume;
+class ModelWipeTower;
 class Print;
 class SLAPrint;
 
@@ -58,6 +69,21 @@ private:
 		ar(cereal::base_class<DynamicPrintConfig>(this));
 	}
 };
+
+namespace Internal {
+	template<typename T>
+	class StaticSerializationWrapper
+	{
+	public:
+		StaticSerializationWrapper(T &wrap) : wrapped(wrap) {}
+	private:
+		friend class cereal::access;
+		friend class UndoRedo::StackImpl;
+		template<class Archive> void load(Archive &ar) { cereal::load_by_value(ar, wrapped); }
+		template<class Archive> void save(Archive &ar) const { cereal::save_by_value(ar, wrapped); }
+		T&	wrapped;
+	};
+}
 
 typedef std::string t_model_material_id;
 typedef std::string t_model_material_attribute;
@@ -133,7 +159,8 @@ private:
 	ModelMaterial() : ObjectBase(-1), config(-1), m_model(nullptr) { assert(this->id().invalid()); assert(this->config.id().invalid()); }
 	template<class Archive> void serialize(Archive &ar) { 
 		assert(this->id().invalid()); assert(this->config.id().invalid());
-		ar(attributes, config);
+		Internal::StaticSerializationWrapper<ModelConfig> config_wrapper(config);
+		ar(attributes, config_wrapper);
 		// assert(this->id().valid()); assert(this->config.id().valid());
 	}
 
@@ -165,6 +192,8 @@ public:
     // Profile of increasing z to a layer height, to be linearly interpolated when calculating the layers.
     // The pairs of <z, layer_height> are packed into a 1D array.
     std::vector<coordf_t>   layer_height_profile;
+    // Whether or not this object is printable
+    bool                    printable;
 
     // This vector holds position of selected support points for SLA. The data are
     // saved in mesh coordinates to allow using them for several instances.
@@ -172,7 +201,7 @@ public:
     std::vector<sla::SupportPoint>      sla_support_points;
     // To keep track of where the points came from (used for synchronization between
     // the SLA gizmo and the backend).
-    sla::PointsStatus sla_points_status = sla::PointsStatus::None;
+    sla::PointsStatus sla_points_status = sla::PointsStatus::NoPoints;
 
     /* This vector accumulates the total translation applied to the object by the
         center_around_origin() method. Callers might want to apply the same translation
@@ -277,11 +306,11 @@ public:
 private:
     friend class Model;
     // This constructor assigns new ID to this ModelObject and its config.
-	explicit ModelObject(Model *model) : m_model(model), origin_translation(Vec3d::Zero()),
+    explicit ModelObject(Model* model) : m_model(model), printable(true), origin_translation(Vec3d::Zero()),
         m_bounding_box_valid(false), m_raw_bounding_box_valid(false), m_raw_mesh_bounding_box_valid(false)
-        { assert(this->id().valid()); }
-	explicit ModelObject(int) : ObjectBase(-1), config(-1), m_model(nullptr), origin_translation(Vec3d::Zero()), m_bounding_box_valid(false), m_raw_bounding_box_valid(false), m_raw_mesh_bounding_box_valid(false)
-		{ assert(this->id().invalid()); assert(this->config.id().invalid()); }
+    { assert(this->id().valid()); }
+    explicit ModelObject(int) : ObjectBase(-1), config(-1), m_model(nullptr), printable(true), origin_translation(Vec3d::Zero()), m_bounding_box_valid(false), m_raw_bounding_box_valid(false), m_raw_mesh_bounding_box_valid(false)
+    { assert(this->id().invalid()); assert(this->config.id().invalid()); }
 	~ModelObject();
 	void assign_new_unique_ids_recursive() override;
 
@@ -342,8 +371,9 @@ private:
 	}
 	template<class Archive> void serialize(Archive &ar) {
 		ar(cereal::base_class<ObjectBase>(this));
-		ar(name, input_file, instances, volumes, config, layer_config_ranges, layer_height_profile, sla_support_points, sla_points_status, origin_translation,
-			m_bounding_box, m_bounding_box_valid, m_raw_bounding_box, m_raw_bounding_box_valid, m_raw_mesh_bounding_box, m_raw_mesh_bounding_box_valid);
+		Internal::StaticSerializationWrapper<ModelConfig> config_wrapper(config);
+        ar(name, input_file, instances, volumes, config_wrapper, layer_config_ranges, layer_height_profile, sla_support_points, sla_points_status, printable, origin_translation,
+            m_bounding_box, m_bounding_box_valid, m_raw_bounding_box, m_raw_bounding_box_valid, m_raw_mesh_bounding_box, m_raw_mesh_bounding_box_valid);
 	}
 };
 
@@ -526,8 +556,25 @@ private:
 	ModelVolume() : ObjectBase(-1), config(-1), object(nullptr) {
 		assert(this->id().invalid()); assert(this->config.id().invalid());
 	}
-	template<class Archive> void serialize(Archive &ar) {
-		ar(name, config, m_mesh, m_type, m_material_id, m_convex_hull, m_transformation, m_is_splittable);
+	template<class Archive> void load(Archive &ar) {
+		bool has_convex_hull;
+		ar(name, m_mesh, m_type, m_material_id, m_transformation, m_is_splittable, has_convex_hull);
+		cereal::load_by_value(ar, config);
+		assert(m_mesh);
+		if (has_convex_hull) {
+			cereal::load_optional(ar, m_convex_hull);
+			if (! m_convex_hull && ! m_mesh->empty())
+				// The convex hull was released from the Undo / Redo stack to conserve memory. Recalculate it.
+				this->calculate_convex_hull();
+		} else
+			m_convex_hull.reset();
+	}
+	template<class Archive> void save(Archive &ar) const {
+		bool has_convex_hull = m_convex_hull.get() != nullptr;
+		ar(name, m_mesh, m_type, m_material_id, m_transformation, m_is_splittable, has_convex_hull);
+		cereal::save_by_value(ar, config);
+		if (has_convex_hull)
+			cereal::save_optional(ar, m_convex_hull);
 	}
 };
 
@@ -550,6 +597,8 @@ private:
 public:
     // flag showing the position of this instance with respect to the print volume (set by Print::validate() using ModelObject::check_instances_print_volume_state())
     EPrintVolumeState print_volume_state;
+    // Whether or not this instance is printable
+    bool printable;
 
     ModelObject* get_object() const { return this->object; }
 
@@ -558,7 +607,7 @@ public:
 
     const Vec3d& get_offset() const { return m_transformation.get_offset(); }
     double get_offset(Axis axis) const { return m_transformation.get_offset(axis); }
-
+    
     void set_offset(const Vec3d& offset) { m_transformation.set_offset(offset); }
     void set_offset(Axis axis, double offset) { m_transformation.set_offset(axis, offset); }
 
@@ -577,7 +626,7 @@ public:
     const Vec3d& get_mirror() const { return m_transformation.get_mirror(); }
     double get_mirror(Axis axis) const { return m_transformation.get_mirror(axis); }
 	bool is_left_handed() const { return m_transformation.is_left_handed(); }
-
+    
     void set_mirror(const Vec3d& mirror) { m_transformation.set_mirror(mirror); }
     void set_mirror(Axis axis, double mirror) { m_transformation.set_mirror(axis, mirror); }
 
@@ -594,7 +643,19 @@ public:
 
     const Transform3d& get_matrix(bool dont_translate = false, bool dont_rotate = false, bool dont_scale = false, bool dont_mirror = false) const { return m_transformation.get_matrix(dont_translate, dont_rotate, dont_scale, dont_mirror); }
 
-    bool is_printable() const { return print_volume_state == PVS_Inside; }
+    bool is_printable() const { return object->printable && printable && (print_volume_state == PVS_Inside); }
+
+    // Getting the input polygon for arrange
+    arrangement::ArrangePolygon get_arrange_polygon() const;
+    
+    // Apply the arrange result on the ModelInstance
+    void apply_arrange_result(const Vec2crd& offs, double rotation)
+    {
+        // write the transformation data into the model instance
+        set_rotation(Z, rotation);
+        set_offset(X, unscale<double>(offs(X)));
+        set_offset(Y, unscale<double>(offs(Y)));
+    }
 
 protected:
     friend class Print;
@@ -610,10 +671,10 @@ private:
     ModelObject* object;
 
     // Constructor, which assigns a new unique ID.
-    explicit ModelInstance(ModelObject *object) : object(object), print_volume_state(PVS_Inside) { assert(this->id().valid()); }
+    explicit ModelInstance(ModelObject* object) : print_volume_state(PVS_Inside), printable(true), object(object) { assert(this->id().valid()); }
     // Constructor, which assigns a new unique ID.
     explicit ModelInstance(ModelObject *object, const ModelInstance &other) :
-        m_transformation(other.m_transformation), object(object), print_volume_state(PVS_Inside) { assert(this->id().valid() && this->id() != other.id()); }
+        m_transformation(other.m_transformation), print_volume_state(PVS_Inside), printable(true), object(object) {assert(this->id().valid() && this->id() != other.id());}
 
     explicit ModelInstance(ModelInstance &&rhs) = delete;
     ModelInstance& operator=(const ModelInstance &rhs) = delete;
@@ -624,8 +685,37 @@ private:
 	// Used for deserialization, therefore no IDs are allocated.
 	ModelInstance() : ObjectBase(-1), object(nullptr) { assert(this->id().invalid()); }
 	template<class Archive> void serialize(Archive &ar) {
-		ar(m_transformation, print_volume_state);
-	}
+        ar(m_transformation, print_volume_state, printable);
+    }
+};
+
+class ModelWipeTower final : public ObjectBase
+{
+public:
+	Vec2d		position;
+	double 		rotation;
+
+private:
+	friend class cereal::access;
+	friend class UndoRedo::StackImpl;
+	friend class Model;
+
+    // Constructors to be only called by derived classes.
+    // Default constructor to assign a unique ID.
+    explicit ModelWipeTower() {}
+    // Constructor with ignored int parameter to assign an invalid ID, to be replaced
+    // by an existing ID copied from elsewhere.
+    explicit ModelWipeTower(int) : ObjectBase(-1) {}
+    // Copy constructor copies the ID.
+	explicit ModelWipeTower(const ModelWipeTower &cfg) = default;
+
+	// Disabled methods.
+	ModelWipeTower(ModelWipeTower &&rhs) = delete;
+	ModelWipeTower& operator=(const ModelWipeTower &rhs) = delete;
+    ModelWipeTower& operator=(ModelWipeTower &&rhs) = delete;
+
+    // For serialization / deserialization of ModelWipeTower composed into another class into the Undo / Redo stack as a separate object.
+    template<typename Archive> void serialize(Archive &ar) { ar(position, rotation); }
 };
 
 // The print bed content.
@@ -635,14 +725,14 @@ private:
 // all objects may share mutliple materials.
 class Model final : public ObjectBase
 {
-    static unsigned int s_auto_extruder_id;
-
 public:
     // Materials are owned by a model and referenced by objects through t_model_material_id.
     // Single material may be shared by multiple models.
     ModelMaterialMap    materials;
     // Objects are owned by a model. Each model may have multiple instances, each instance having its own transformation (shift, scale, rotation).
     ModelObjectPtrs     objects;
+    // Wipe tower object.
+    ModelWipeTower	    wipe_tower;
     
     // Default constructor assigns a new ID to the model.
     Model() { assert(this->id().valid()); }
@@ -657,8 +747,8 @@ public:
 
     OBJECTBASE_DERIVED_COPY_MOVE_CLONE(Model)
 
-    static Model read_from_file(const std::string &input_file, DynamicPrintConfig *config = nullptr, bool add_default_instances = true);
-    static Model read_from_archive(const std::string &input_file, DynamicPrintConfig *config, bool add_default_instances = true);
+    static Model read_from_file(const std::string& input_file, DynamicPrintConfig* config = nullptr, bool add_default_instances = true, bool check_version = false);
+    static Model read_from_archive(const std::string& input_file, DynamicPrintConfig* config, bool add_default_instances = true, bool check_version = false);
 
     // Add a new ModelObject to this Model, generate a new ID for this ModelObject.
     ModelObject* add_object();
@@ -703,14 +793,10 @@ public:
 
     void 		  print_info() const { for (const ModelObject *o : this->objects) o->print_info(); }
 
-    static unsigned int get_auto_extruder_id(unsigned int max_extruders);
-    static std::string get_auto_extruder_id_as_string(unsigned int max_extruders);
-    static void reset_auto_extruder_id();
-
     // Propose an output file name & path based on the first printable object's name and source input file's path.
-    std::string         propose_export_file_name_and_path() const;
+    std::string   propose_export_file_name_and_path() const;
     // Propose an output path, replace extension. The new_extension shall contain the initial dot.
-    std::string         propose_export_file_name_and_path(const std::string &new_extension) const;
+    std::string   propose_export_file_name_and_path(const std::string &new_extension) const;
 
 private:
 	explicit Model(int) : ObjectBase(-1) { assert(this->id().invalid()); };
@@ -720,7 +806,8 @@ private:
 	friend class cereal::access;
 	friend class UndoRedo::StackImpl;
 	template<class Archive> void serialize(Archive &ar) {
-		ar(materials, objects);
+		Internal::StaticSerializationWrapper<ModelWipeTower> wipe_tower_wrapper(wipe_tower);
+		ar(materials, objects, wipe_tower_wrapper);
 	}
 };
 
@@ -739,6 +826,12 @@ extern bool model_object_list_extended(const Model &model_old, const Model &mode
 // than the old ModelObject.
 extern bool model_volume_list_changed(const ModelObject &model_object_old, const ModelObject &model_object_new, const ModelVolumeType type);
 
+// If the model has multi-part objects, then it is currently not supported by the SLA mode.
+// Either the model cannot be loaded, or a SLA printer has to be activated.
+extern bool model_has_multi_part_objects(const Model &model);
+// If the model has advanced features, then it cannot be processed in simple mode.
+extern bool model_has_advanced_features(const Model &model);
+
 #ifndef NDEBUG
 // Verify whether the IDs of Model / ModelObject / ModelVolume / ModelInstance / ModelMaterial are valid and unique.
 void check_model_ids_validity(const Model &model);
@@ -746,5 +839,11 @@ void check_model_ids_equal(const Model &model1, const Model &model2);
 #endif /* NDEBUG */
 
 } // namespace Slic3r
+
+namespace cereal
+{
+	template <class Archive> struct specialize<Archive, Slic3r::ModelVolume, cereal::specialization::member_load_save> {};
+	template <class Archive> struct specialize<Archive, Slic3r::ModelConfig, cereal::specialization::member_serialize> {};
+}
 
 #endif /* slic3r_Model_hpp_ */

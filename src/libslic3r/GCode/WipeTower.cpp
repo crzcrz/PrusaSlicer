@@ -22,6 +22,7 @@ TODO LIST
 #include <numeric>
 
 #include "Analyzer.hpp"
+#include "BoundingBox.hpp"
 
 #if defined(__linux) || defined(__GNUC__ )
 #include <strings.h>
@@ -34,19 +35,6 @@ TODO LIST
 
 namespace Slic3r
 {
-
-// Rotate the point around center of the wipe tower about given angle (in degrees)
-static Vec2f rotate(const Vec2f& pt, float width, float depth, float angle)
-{
-    Vec2f out(0,0);
-    float temp_x = pt(0) - width / 2.f;
-    float temp_y = pt(1) - depth / 2.f;
-    angle *= float(M_PI/180.);
-    out.x() += temp_x * cos(angle)  -  temp_y * sin(angle) + width / 2.f;
-    out.y() += temp_x * sin(angle)  +  temp_y * cos(angle) + depth / 2.f;
-    return out;
-}
-
 
 class WipeTowerWriter
 {
@@ -94,7 +82,7 @@ public:
         m_wipe_tower_width = width;
         m_wipe_tower_depth = depth;
         m_internal_angle = internal_angle;
-		m_start_pos = rotate(pos + Vec2f(0.f,m_y_shift), m_wipe_tower_width, m_wipe_tower_depth, m_internal_angle);
+		m_start_pos = this->rotate(pos);
 		m_current_pos = pos;
 		return *this;
 	}
@@ -111,6 +99,11 @@ public:
         m_current_pos.y() -= shift-m_y_shift;
         m_y_shift = shift;
         return (*this);
+    }
+
+    WipeTowerWriter&            disable_linear_advance() {
+        m_gcode += (m_gcode_flavor == gcfRepRap ? std::string("M572 D0 S0\n") : std::string("M900 K0\n"));
+        return *this;
     }
 
 	// Suppress / resume G-code preview in Slic3r. Slic3r will have difficulty to differentiate the various
@@ -130,9 +123,9 @@ public:
 	const std::vector<WipeTower::Extrusion>& extrusions() const { return m_extrusions; }
 	float                x()     const { return m_current_pos.x(); }
 	float                y()     const { return m_current_pos.y(); }
-	const Vec2f& pos()   const { return m_current_pos; }
-	const Vec2f	 start_pos_rotated() const { return m_start_pos; }
-	const Vec2f  pos_rotated() const { return rotate(m_current_pos + Vec2f(0.f, m_y_shift), m_wipe_tower_width, m_wipe_tower_depth, m_internal_angle); }
+	const Vec2f& 		 pos()   const { return m_current_pos; }
+	const Vec2f	 		 start_pos_rotated() const { return m_start_pos; }
+	const Vec2f  		 pos_rotated() const { return this->rotate(m_current_pos); }
 	float 				 elapsed_time() const { return m_elapsed_time; }
     float                get_and_reset_used_filament_length() { float temp = m_used_filament_length; m_used_filament_length = 0.f; return temp; }
 
@@ -150,14 +143,14 @@ public:
             m_used_filament_length += e;
 
 		// Now do the "internal rotation" with respect to the wipe tower center
-		Vec2f rotated_current_pos(rotate(m_current_pos + Vec2f(0.f,m_y_shift), m_wipe_tower_width, m_wipe_tower_depth, m_internal_angle)); // this is where we are
-		Vec2f rot(rotate(Vec2f(x,y+m_y_shift), m_wipe_tower_width, m_wipe_tower_depth, m_internal_angle));                               // this is where we want to go
+		Vec2f rotated_current_pos(this->pos_rotated());
+		Vec2f rot(this->rotate(Vec2f(x,y)));                               // this is where we want to go
 
 		if (! m_preview_suppressed && e > 0.f && len > 0.) {
             change_analyzer_mm3_per_mm(len, e);
 			// Width of a squished extrusion, corrected for the roundings of the squished extrusions.
 			// This is left zero if it is a travel move.
-			float width = float(double(e) * /*Filament_Area*/2.40528 / (len * m_layer_height));
+			float width = float(double(e) * m_filpar[0].filament_area / (len * m_layer_height));
 			// Correct for the roundings of a squished extrusion.
 			width += m_layer_height * float(1. - M_PI / 4.);
 			if (m_extrusions.empty() || m_extrusions.back().pos != rotated_current_pos)
@@ -466,7 +459,96 @@ private:
 	}
 
 	WipeTowerWriter& operator=(const WipeTowerWriter &rhs);
+
+	// Rotate the point around center of the wipe tower about given angle (in degrees)
+	Vec2f rotate(Vec2f pt) const
+	{
+		pt.x() -= m_wipe_tower_width / 2.f;
+		pt.y() += m_y_shift - m_wipe_tower_depth / 2.f;
+	    double angle = m_internal_angle * float(M_PI/180.);
+	    double c = cos(angle);
+	    double s = sin(angle);
+	    return Vec2f(float(pt.x() * c - pt.y() * s) + m_wipe_tower_width / 2.f, float(pt.x() * s + pt.y() * c) + m_wipe_tower_depth / 2.f);
+	}
+
 }; // class WipeTowerWriter
+
+
+
+WipeTower::WipeTower(const PrintConfig& config, const std::vector<std::vector<float>>& wiping_matrix, size_t initial_tool) :
+    m_semm(config.single_extruder_multi_material.value),
+    m_wipe_tower_pos(config.wipe_tower_x, config.wipe_tower_y),
+    m_wipe_tower_width(config.wipe_tower_width),
+    m_wipe_tower_rotation_angle(config.wipe_tower_rotation_angle),
+    m_y_shift(0.f),
+    m_z_pos(0.f),
+    m_is_first_layer(false),
+    m_bridging(config.wipe_tower_bridging),
+    m_gcode_flavor(config.gcode_flavor),
+    m_current_tool(initial_tool),
+    wipe_volumes(wiping_matrix)
+{
+    // If this is a single extruder MM printer, we will use all the SE-specific config values.
+    // Otherwise, the defaults will be used to turn off the SE stuff.
+    if (m_semm) {
+        m_cooling_tube_retraction = config.cooling_tube_retraction;
+        m_cooling_tube_length = config.cooling_tube_length;
+        m_parking_pos_retraction = config.parking_pos_retraction;
+        m_extra_loading_move = config.extra_loading_move;
+        m_set_extruder_trimpot = config.high_current_on_filament_swap;
+    }
+    // Calculate where the priming lines should be - very naive test not detecting parallelograms or custom shapes
+    const std::vector<Vec2d>& bed_points = config.bed_shape.values;
+    m_bed_shape = (bed_points.size() == 4 ? RectangularBed : CircularBed);
+    m_bed_width = BoundingBoxf(bed_points).size().x();
+}
+
+
+
+void WipeTower::set_extruder(size_t idx, const PrintConfig& config)
+{
+    //while (m_filpar.size() < idx+1)   // makes sure the required element is in the vector
+    m_filpar.push_back(FilamentParameters());
+
+    m_filpar[idx].material = config.filament_type.get_at(idx);
+    m_filpar[idx].temperature = config.temperature.get_at(idx);
+    m_filpar[idx].first_layer_temperature = config.first_layer_temperature.get_at(idx);
+
+    // If this is a single extruder MM printer, we will use all the SE-specific config values.
+    // Otherwise, the defaults will be used to turn off the SE stuff.
+    if (m_semm) {
+        m_filpar[idx].loading_speed           = config.filament_loading_speed.get_at(idx);
+        m_filpar[idx].loading_speed_start     = config.filament_loading_speed_start.get_at(idx);
+        m_filpar[idx].unloading_speed         = config.filament_unloading_speed.get_at(idx);
+        m_filpar[idx].unloading_speed_start   = config.filament_unloading_speed_start.get_at(idx);
+        m_filpar[idx].delay                   = config.filament_toolchange_delay.get_at(idx);
+        m_filpar[idx].cooling_moves           = config.filament_cooling_moves.get_at(idx);
+        m_filpar[idx].cooling_initial_speed   = config.filament_cooling_initial_speed.get_at(idx);
+        m_filpar[idx].cooling_final_speed     = config.filament_cooling_final_speed.get_at(idx);
+    }
+
+    m_filpar[idx].filament_area = float((M_PI/4.f) * pow(config.filament_diameter.get_at(idx), 2)); // all extruders are assumed to have the same filament diameter at this point
+    float nozzle_diameter = config.nozzle_diameter.get_at(idx);
+    m_filpar[idx].nozzle_diameter = nozzle_diameter; // to be used in future with (non-single) multiextruder MM
+
+    float max_vol_speed = config.filament_max_volumetric_speed.get_at(idx);
+    if (max_vol_speed!= 0.f)
+        m_filpar[idx].max_e_speed = (max_vol_speed / filament_area());
+
+    m_perimeter_width = nozzle_diameter * Width_To_Nozzle_Ratio; // all extruders are now assumed to have the same diameter
+
+    if (m_semm) {
+        std::istringstream stream{config.filament_ramming_parameters.get_at(idx)};
+        float speed = 0.f;
+        stream >> m_filpar[idx].ramming_line_width_multiplicator >> m_filpar[idx].ramming_step_multiplicator;
+        m_filpar[idx].ramming_line_width_multiplicator /= 100;
+        m_filpar[idx].ramming_step_multiplicator /= 100;
+        while (stream >> speed)
+            m_filpar[idx].ramming_speed.push_back(speed);
+    }
+
+    m_used_filament_length.resize(std::max(m_used_filament_length.size(), idx + 1)); // makes sure that the vector is big enough so we don't have to check later
+}
 
 
 
@@ -488,9 +570,11 @@ std::vector<WipeTower::ToolChangeResult> WipeTower::prime(
     // therefore the homing position is shifted inside the bed by 0.2 in the firmware to [0.2, -2.0].
 //	box_coordinates cleaning_box(xy(0.5f, - 1.5f), m_wipe_tower_width, wipe_area);
 
-	const float prime_section_width = std::min(240.f / tools.size(), 60.f);
-	box_coordinates cleaning_box(Vec2f(5.f, 0.01f + m_perimeter_width/2.f), prime_section_width, 100.f);
-
+    float prime_section_width = std::min(0.9f * m_bed_width / tools.size(), 60.f);
+    box_coordinates cleaning_box(Vec2f(0.02f * m_bed_width, 0.01f + m_perimeter_width/2.f), prime_section_width, 100.f);
+    // In case of a circular bed, place it so it goes across the diameter and hope it will fit
+    if (m_bed_shape == CircularBed)
+        cleaning_box.translate(-m_bed_width/2 + m_bed_width * 0.03f, -m_bed_width * 0.12f);
 
     std::vector<ToolChangeResult> results;
 
@@ -553,7 +637,7 @@ std::vector<WipeTower::ToolChangeResult> WipeTower::prime(
         result.elapsed_time = writer.elapsed_time();
         result.extrusions 	= writer.extrusions();
         result.start_pos  	= writer.start_pos_rotated();
-        result.end_pos 	  	= writer.pos_rotated();
+        result.end_pos 	  	= writer.pos();
 
         results.push_back(std::move(result));
 
@@ -643,7 +727,7 @@ WipeTower::ToolChangeResult WipeTower::tool_change(unsigned int tool, bool last_
                           m_is_first_layer ? m_filpar[tool].first_layer_temperature : m_filpar[tool].temperature);
         toolchange_Change(writer, tool, m_filpar[tool].material); // Change the tool, set a speed override for soluble and flex materials.
         toolchange_Load(writer, cleaning_box);
-        writer.travel(writer.x(),writer.y()-m_perimeter_width); // cooling and loading were done a bit down the road
+        writer.travel(writer.x(), writer.y()-m_perimeter_width); // cooling and loading were done a bit down the road
         toolchange_Wipe(writer, cleaning_box, wipe_volume);     // Wipe the newly loaded filament until the end of the assigned wipe area.
         ++ m_num_tool_changes;
     } else
@@ -818,11 +902,13 @@ void WipeTower::toolchange_Unload(
         }
     }
 
+    writer.disable_linear_advance();
+
     // now the ramming itself:
     while (i < m_filpar[m_current_tool].ramming_speed.size())
     {
         const float x = volume_to_length(m_filpar[m_current_tool].ramming_speed[i] * 0.25f, line_width, m_layer_height);
-        const float e = m_filpar[m_current_tool].ramming_speed[i] * 0.25f / Filament_Area; // transform volume per sec to E move;
+        const float e = m_filpar[m_current_tool].ramming_speed[i] * 0.25f / filament_area(); // transform volume per sec to E move;
         const float dist = std::min(x - e_done, remaining);		  // distance to travel for either the next 0.25s, or to the next turnaround
         const float actual_time = dist/x * 0.25;
         writer.ram(writer.x(), writer.x() + (m_left_to_right ? 1.f : -1.f) * dist, 0, 0, e * (dist / x), dist / (actual_time / 60.));
@@ -860,11 +946,16 @@ void WipeTower::toolchange_Unload(
               .travel(old_x, writer.y()) // in case previous move was shortened to limit feedrate*/
               .resume_preview();
     }
-    if (new_temperature != 0 && (new_temperature != m_old_temperature || m_is_first_layer) ) { 	// Set the extruder temperature, but don't wait.
-        // If the required temperature is the same as last time, don't emit the M104 again (if user adjusted the value, it would be reset)
-        // However, always change temperatures on the first layer (this is to avoid issues with priming lines turned off).
-		writer.set_extruder_temp(new_temperature, false);
-        m_old_temperature = new_temperature;
+    // Wipe tower should only change temperature with single extruder MM. Otherwise, all temperatures should
+    // be already set and there is no need to change anything. Also, the temperature could be changed
+    // for wrong extruder.
+    if (m_semm) {
+        if (new_temperature != 0 && (new_temperature != m_old_temperature || m_is_first_layer) ) { 	// Set the extruder temperature, but don't wait.
+            // If the required temperature is the same as last time, don't emit the M104 again (if user adjusted the value, it would be reset)
+            // However, always change temperatures on the first layer (this is to avoid issues with priming lines turned off).
+            writer.set_extruder_temp(new_temperature, false);
+            m_old_temperature = new_temperature;
+        }
     }
 
     // Cooling:
@@ -914,6 +1005,11 @@ void WipeTower::toolchange_Change(
     // These will be substituted by the actual gcodes when the gcode is generated.
     writer.append("[end_filament_gcode]\n");
     writer.append("[toolchange_gcode]\n");
+
+    // Travel to where we assume we are. Custom toolchange or some special T code handling (parking extruder etc)
+    // gcode could have left the extruder somewhere, we cannot just start extruding.
+	Vec2f current_pos = writer.pos_rotated();
+    writer.append(std::string("G1 X") + std::to_string(current_pos.x()) +  " Y" + std::to_string(current_pos.y()) +  "\n");
 
     // The toolchange Tn command will be inserted later, only in case that the user does
     // not provide a custom toolchange gcode.
@@ -1241,6 +1337,8 @@ void WipeTower::generate(std::vector<std::vector<WipeTower::ToolChangeResult>> &
 
     for (auto& used : m_used_filament_length) // reset used filament stats
         used = 0.f;
+
+    m_old_temperature = -1; // reset last temperature written in the gcode
 
     std::vector<WipeTower::ToolChangeResult> layer_result;
 	for (auto layer : m_plan)

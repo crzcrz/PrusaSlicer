@@ -100,6 +100,7 @@ void Selection::set_volumes(GLVolumePtrs* volumes)
     update_valid();
 }
 
+// Init shall be called from the OpenGL render function, so that the OpenGL context is initialized!
 bool Selection::init()
 {
     if (!m_arrow.init())
@@ -140,11 +141,13 @@ void Selection::add(unsigned int volume_idx, bool as_single_selection, bool chec
     needs_reset |= as_single_selection && !is_any_modifier() && volume->is_modifier;
     needs_reset |= is_any_modifier() && !volume->is_modifier;
 
-    if (needs_reset)
-        clear();
-
     if (!already_contained || needs_reset)
     {
+        wxGetApp().plater()->take_snapshot(_(L("Selection-Add")));
+
+        if (needs_reset)
+            clear();
+
         if (!keep_instance_mode)
             m_mode = volume->is_modifier ? Volume : Instance;
     }
@@ -163,7 +166,8 @@ void Selection::add(unsigned int volume_idx, bool as_single_selection, bool chec
     }
     case Instance:
     {
-        do_add_instance(volume->object_idx(), volume->instance_idx());
+        Plater::SuppressSnapshots suppress(wxGetApp().plater());
+        add_instance(volume->object_idx(), volume->instance_idx(), as_single_selection);
         break;
     }
     }
@@ -176,6 +180,11 @@ void Selection::remove(unsigned int volume_idx)
 {
     if (!m_valid || ((unsigned int)m_volumes->size() <= volume_idx))
         return;
+
+    if (!contains_volume(volume_idx))
+        return;
+
+    wxGetApp().plater()->take_snapshot(_(L("Selection-Remove")));
 
     GLVolume* volume = (*m_volumes)[volume_idx];
 
@@ -202,13 +211,20 @@ void Selection::add_object(unsigned int object_idx, bool as_single_selection)
     if (!m_valid)
         return;
 
+    std::vector<unsigned int> volume_idxs = get_volume_idxs_from_object(object_idx);
+    if ((!as_single_selection && contains_all_volumes(volume_idxs)) ||
+        (as_single_selection && matches(volume_idxs)))
+        return;
+
+    wxGetApp().plater()->take_snapshot(_(L("Selection-Add Object")));
+
     // resets the current list if needed
     if (as_single_selection)
         clear();
 
     m_mode = Instance;
 
-    do_add_object(object_idx);
+    do_add_volumes(volume_idxs);
 
     update_type();
     this->set_bounding_boxes_dirty();
@@ -218,6 +234,8 @@ void Selection::remove_object(unsigned int object_idx)
 {
     if (!m_valid)
         return;
+
+    wxGetApp().plater()->take_snapshot(_(L("Selection-Remove Object")));
 
     do_remove_object(object_idx);
 
@@ -230,13 +248,20 @@ void Selection::add_instance(unsigned int object_idx, unsigned int instance_idx,
     if (!m_valid)
         return;
 
+    std::vector<unsigned int> volume_idxs = get_volume_idxs_from_instance(object_idx, instance_idx);
+    if ((!as_single_selection && contains_all_volumes(volume_idxs)) ||
+        (as_single_selection && matches(volume_idxs)))
+        return;
+
+    wxGetApp().plater()->take_snapshot(_(L("Selection-Add Instance")));
+
     // resets the current list if needed
     if (as_single_selection)
         clear();
 
     m_mode = Instance;
 
-    do_add_instance(object_idx, instance_idx);
+    do_add_volumes(volume_idxs);
 
     update_type();
     this->set_bounding_boxes_dirty();
@@ -246,6 +271,8 @@ void Selection::remove_instance(unsigned int object_idx, unsigned int instance_i
 {
     if (!m_valid)
         return;
+
+    wxGetApp().plater()->take_snapshot(_(L("Selection-Remove Instance")));
 
     do_remove_instance(object_idx, instance_idx);
 
@@ -258,21 +285,18 @@ void Selection::add_volume(unsigned int object_idx, unsigned int volume_idx, int
     if (!m_valid)
         return;
 
+    std::vector<unsigned int> volume_idxs = get_volume_idxs_from_volume(object_idx, instance_idx, volume_idx);
+    if ((!as_single_selection && contains_all_volumes(volume_idxs)) ||
+        (as_single_selection && matches(volume_idxs)))
+        return;
+
     // resets the current list if needed
     if (as_single_selection)
         clear();
 
     m_mode = Volume;
 
-    for (unsigned int i = 0; i < (unsigned int)m_volumes->size(); ++i)
-    {
-        GLVolume* v = (*m_volumes)[i];
-        if ((v->object_idx() == object_idx) && (v->volume_idx() == volume_idx))
-        {
-            if ((instance_idx != -1) && (v->instance_idx() == instance_idx))
-                do_add_volume(i);
-        }
-    }
+    do_add_volumes(volume_idxs);
 
     update_type();
     this->set_bounding_boxes_dirty();
@@ -294,10 +318,62 @@ void Selection::remove_volume(unsigned int object_idx, unsigned int volume_idx)
     this->set_bounding_boxes_dirty();
 }
 
+void Selection::add_volumes(EMode mode, const std::vector<unsigned int>& volume_idxs, bool as_single_selection)
+{
+    if (!m_valid)
+        return;
+
+    if ((!as_single_selection && contains_all_volumes(volume_idxs)) ||
+        (as_single_selection && matches(volume_idxs)))
+        return;
+
+    // resets the current list if needed
+    if (as_single_selection)
+        clear();
+
+    m_mode = mode;
+    for (unsigned int i : volume_idxs)
+    {
+        if (i < (unsigned int)m_volumes->size())
+            do_add_volume(i);
+    }
+
+    update_type();
+    this->set_bounding_boxes_dirty();
+}
+
+void Selection::remove_volumes(EMode mode, const std::vector<unsigned int>& volume_idxs)
+{
+    if (!m_valid)
+        return;
+
+    m_mode = mode;
+    for (unsigned int i : volume_idxs)
+    {
+        if (i < (unsigned int)m_volumes->size())
+            do_remove_volume(i);
+    }
+
+    update_type();
+    this->set_bounding_boxes_dirty();
+}
+
 void Selection::add_all()
 {
     if (!m_valid)
         return;
+
+    unsigned int count = 0;
+    for (unsigned int i = 0; i < (unsigned int)m_volumes->size(); ++i)
+    {
+        if (!(*m_volumes)[i]->is_wipe_tower)
+            ++count;
+    }
+
+    if ((unsigned int)m_list.size() == count)
+        return;
+    
+    wxGetApp().plater()->take_snapshot(_(L("Selection-Add All")));
 
     m_mode = Instance;
     clear();
@@ -310,6 +386,23 @@ void Selection::add_all()
 
     update_type();
     this->set_bounding_boxes_dirty();
+}
+
+void Selection::remove_all()
+{
+    if (!m_valid)
+        return;
+
+    if (is_empty())
+        return;
+  
+// Not taking the snapshot with non-empty Redo stack will likely be more confusing than losing the Redo stack.
+// Let's wait for user feedback.
+//    if (!wxGetApp().plater()->can_redo())
+        wxGetApp().plater()->take_snapshot(_(L("Selection-Remove All")));
+
+    m_mode = Instance;
+    clear();
 }
 
 void Selection::set_deserialized(EMode mode, const std::vector<std::pair<size_t, size_t>> &volumes_and_instances)
@@ -437,6 +530,43 @@ bool Selection::is_sla_compliant() const
     }
 
     return true;
+}
+
+bool Selection::contains_all_volumes(const std::vector<unsigned int>& volume_idxs) const
+{
+    for (unsigned int i : volume_idxs)
+    {
+        if (m_list.find(i) == m_list.end())
+            return false;
+    }
+
+    return true;
+}
+
+bool Selection::contains_any_volume(const std::vector<unsigned int>& volume_idxs) const
+{
+    for (unsigned int i : volume_idxs)
+    {
+        if (m_list.find(i) != m_list.end())
+            return true;
+    }
+
+    return false;
+}
+
+bool Selection::matches(const std::vector<unsigned int>& volume_idxs) const
+{
+    unsigned int count = 0;
+
+    for (unsigned int i : volume_idxs)
+    {
+        if (m_list.find(i) != m_list.end())
+            ++count;
+        else
+            return false;
+    }
+
+    return count == (unsigned int)m_list.size();
 }
 
 bool Selection::requires_uniform_scale() const
@@ -816,12 +946,12 @@ void Selection::scale_to_fit_print_volume(const DynamicPrintConfig& config)
                 // apply scale
                 start_dragging();
                 scale(s * Vec3d::Ones(), type);
-                wxGetApp().plater()->canvas3D()->do_scale(L("")); // avoid storing another snapshot
+                wxGetApp().plater()->canvas3D()->do_scale(""); // avoid storing another snapshot
 
                 // center selection on print bed
                 start_dragging();
                 translate(print_volume.center() - get_bounding_box().center());
-                wxGetApp().plater()->canvas3D()->do_move(L("")); // avoid storing another snapshot
+                wxGetApp().plater()->canvas3D()->do_move(""); // avoid storing another snapshot
 
                 wxGetApp().obj_manipul()->set_dirty();
             }
@@ -1253,6 +1383,111 @@ void Selection::paste_from_clipboard()
     }
 }
 
+std::vector<unsigned int> Selection::get_volume_idxs_from_object(unsigned int object_idx) const
+{
+    std::vector<unsigned int> idxs;
+
+    for (unsigned int i = 0; i < (unsigned int)m_volumes->size(); ++i)
+    {
+        if ((*m_volumes)[i]->object_idx() == object_idx)
+            idxs.push_back(i);
+    }
+
+    return idxs;
+}
+
+std::vector<unsigned int> Selection::get_volume_idxs_from_instance(unsigned int object_idx, unsigned int instance_idx) const
+{
+    std::vector<unsigned int> idxs;
+
+    for (unsigned int i = 0; i < (unsigned int)m_volumes->size(); ++i)
+    {
+        const GLVolume* v = (*m_volumes)[i];
+        if ((v->object_idx() == object_idx) && (v->instance_idx() == instance_idx))
+            idxs.push_back(i);
+    }
+
+    return idxs;
+}
+
+std::vector<unsigned int> Selection::get_volume_idxs_from_volume(unsigned int object_idx, unsigned int instance_idx, unsigned int volume_idx) const
+{
+    std::vector<unsigned int> idxs;
+
+    for (unsigned int i = 0; i < (unsigned int)m_volumes->size(); ++i)
+    {
+        const GLVolume* v = (*m_volumes)[i];
+        if ((v->object_idx() == object_idx) && (v->volume_idx() == volume_idx))
+        {
+            if ((instance_idx != -1) && (v->instance_idx() == instance_idx))
+                idxs.push_back(i);
+        }
+    }
+
+    return idxs;
+}
+
+std::vector<unsigned int> Selection::get_missing_volume_idxs_from(const std::vector<unsigned int>& volume_idxs) const
+{
+    std::vector<unsigned int> idxs;
+
+    for (unsigned int i : m_list)
+    {
+        std::vector<unsigned int>::const_iterator it = std::find(volume_idxs.begin(), volume_idxs.end(), i);
+        if (it == volume_idxs.end())
+            idxs.push_back(i);
+    }
+
+    return idxs;
+}
+
+std::vector<unsigned int> Selection::get_unselected_volume_idxs_from(const std::vector<unsigned int>& volume_idxs) const
+{
+    std::vector<unsigned int> idxs;
+
+    for (unsigned int i : volume_idxs)
+    {
+        if (m_list.find(i) == m_list.end())
+            idxs.push_back(i);
+    }
+
+    return idxs;
+}
+
+void Selection::toggle_instance_printable_state()
+{
+    int instance_idx = get_instance_idx();
+    if (instance_idx == -1)
+        return;
+
+    int obj_idx = get_object_idx();
+    if ((0 <= obj_idx) && (obj_idx < (int)m_model->objects.size()))
+    {
+        ModelObject* model_object = m_model->objects[obj_idx];
+        if ((0 <= instance_idx) && (instance_idx < (int)model_object->instances.size()))
+        {
+            ModelInstance* instance = model_object->instances[instance_idx];
+            const bool printable = !instance->printable;
+
+            wxString snapshot_text = model_object->instances.size() == 1 ? wxString::Format("%s %s",
+                                     printable ? _(L("Set Printable")) : _(L("Set Unprintable")), model_object->name) :
+                                     printable ? _(L("Set Printable Instance")) : _(L("Set Unprintable Instance"));
+            wxGetApp().plater()->take_snapshot(snapshot_text);
+
+            instance->printable = printable;
+
+            for (GLVolume* volume : *m_volumes)
+            {
+                if ((volume->object_idx() == obj_idx) && (volume->instance_idx() == instance_idx))
+                    volume->printable = instance->printable;
+            }
+
+            wxGetApp().obj_list()->update_printable_state(obj_idx, instance_idx);
+            wxGetApp().plater()->update();
+        }
+    }
+}
+
 void Selection::update_valid()
 {
     m_valid = (m_volumes != nullptr) && (m_model != nullptr);
@@ -1499,22 +1734,11 @@ void Selection::do_add_volume(unsigned int volume_idx)
     (*m_volumes)[volume_idx]->selected = true;
 }
 
-void Selection::do_add_instance(unsigned int object_idx, unsigned int instance_idx)
+void Selection::do_add_volumes(const std::vector<unsigned int>& volume_idxs)
 {
-    for (unsigned int i = 0; i < (unsigned int)m_volumes->size(); ++i)
+    for (unsigned int i : volume_idxs)
     {
-        GLVolume* v = (*m_volumes)[i];
-        if ((v->object_idx() == object_idx) && (v->instance_idx() == instance_idx))
-            do_add_volume(i);
-    }
-}
-
-void Selection::do_add_object(unsigned int object_idx)
-{
-    for (unsigned int i = 0; i < (unsigned int)m_volumes->size(); ++i)
-    {
-        GLVolume* v = (*m_volumes)[i];
-        if (v->object_idx() == object_idx)
+        if (i < (unsigned int)m_volumes->size())
             do_add_volume(i);
     }
 }

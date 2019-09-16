@@ -185,10 +185,18 @@ public:
 
     static void handle_legacy(t_config_option_key &opt_key, std::string &value);
 
+    // Options defining the extruder retract properties. These keys are sorted lexicographically.
+    // The extruder retract keys could be overidden by the same values defined at the Filament level
+    // (then the key is further prefixed with the "filament_" prefix).
+    const std::vector<std::string>& extruder_retract_keys() const { return m_extruder_retract_keys; }
+
 private:
     void init_common_params();
     void init_fff_params();
+    void init_extruder_retract_keys();
     void init_sla_params();
+
+    std::vector<std::string> 	m_extruder_retract_keys;
 };
 
 // The one and only global definition of SLic3r configuration options.
@@ -732,7 +740,7 @@ protected:
 class PrintConfig : public MachineEnvelopeConfig, public GCodeConfig
 {
     STATIC_PRINT_CONFIG_CACHE_DERIVED(PrintConfig)
-	PrintConfig() : MachineEnvelopeConfig(0), GCodeConfig(0) { initialize_cache(); *this = s_cache_PrintConfig.defaults(); }
+    PrintConfig() : MachineEnvelopeConfig(0), GCodeConfig(0) { initialize_cache(); *this = s_cache_PrintConfig.defaults(); }
 public:
     double                          min_object_distance() const;
     static double                   min_object_distance(const ConfigBase *config);
@@ -804,7 +812,7 @@ public:
     ConfigOptionFloat               z_offset;
 
 protected:
-	PrintConfig(int) : MachineEnvelopeConfig(1), GCodeConfig(1) {}
+    PrintConfig(int) : MachineEnvelopeConfig(1), GCodeConfig(1) {}
     void initialize(StaticCacheBase &cache, const char *base_ptr)
     {
         this->MachineEnvelopeConfig::initialize(cache, base_ptr);
@@ -983,7 +991,7 @@ public:
 
     // The height of the pillar base cone in mm.
     ConfigOptionFloat support_base_height /*= 1.0*/;
-    
+
     // The minimum distance of the pillar base from the model in mm.
     ConfigOptionFloat support_base_safety_distance; /*= 1.0*/;
 
@@ -999,7 +1007,7 @@ public:
     // The elevation in Z direction upwards. This is the space between the pad
     // and the model object's bounding box bottom. Units in mm.
     ConfigOptionFloat support_object_elevation /*= 5.0*/;
-    
+
     /////// Following options influence automatic support points placement:
     ConfigOptionInt support_points_density_relative;
     ConfigOptionFloat support_points_minimal_distance;
@@ -1020,11 +1028,11 @@ public:
     ConfigOptionFloat pad_max_merge_distance /*= 50*/;
 
     // The smoothing radius of the pad edges
-    ConfigOptionFloat pad_edge_radius /*= 1*/;
+    // ConfigOptionFloat pad_edge_radius /*= 1*/;
 
     // The slope of the pad wall...
     ConfigOptionFloat pad_wall_slope;
-    
+
     // /////////////////////////////////////////////////////////////////////////
     // Zero elevation mode parameters:
     //    - The object pad will be derived from the the model geometry.
@@ -1032,16 +1040,19 @@ public:
     //      according to the support_base_safety_distance parameter.
     //    - The two pads will be connected with tiny connector sticks
     // /////////////////////////////////////////////////////////////////////////
-    
+
+    // Disable the elevation (ignore its value) and use the zero elevation mode
+    ConfigOptionBool  pad_around_object;
+
     // This is the gap between the object bottom and the generated pad
     ConfigOptionFloat pad_object_gap;
-    
+
     // How far to place the connector sticks on the object pad perimeter
     ConfigOptionFloat pad_object_connector_stride;
-    
+
     // The width of the connectors sticks
     ConfigOptionFloat pad_object_connector_width;
-    
+
     // How much should the tiny connectors penetrate into the model body
     ConfigOptionFloat pad_object_connector_penetration;
 
@@ -1072,8 +1083,9 @@ protected:
         OPT_PTR(pad_wall_thickness);
         OPT_PTR(pad_wall_height);
         OPT_PTR(pad_max_merge_distance);
-        OPT_PTR(pad_edge_radius);
+        // OPT_PTR(pad_edge_radius);
         OPT_PTR(pad_wall_slope);
+        OPT_PTR(pad_around_object);
         OPT_PTR(pad_object_gap);
         OPT_PTR(pad_object_connector_stride);
         OPT_PTR(pad_object_connector_width);
@@ -1119,6 +1131,10 @@ public:
     ConfigOptionFloat                       fast_tilt_time;
     ConfigOptionFloat                       slow_tilt_time;
     ConfigOptionFloat                       area_fill;
+    ConfigOptionFloat                       min_exposure_time;
+    ConfigOptionFloat                       max_exposure_time;
+    ConfigOptionFloat                       min_initial_exposure_time;
+    ConfigOptionFloat                       max_initial_exposure_time;
 protected:
     void initialize(StaticCacheBase &cache, const char *base_ptr)
     {
@@ -1138,6 +1154,10 @@ protected:
         OPT_PTR(fast_tilt_time);
         OPT_PTR(slow_tilt_time);
         OPT_PTR(area_fill);
+        OPT_PTR(min_exposure_time);
+        OPT_PTR(max_exposure_time);
+        OPT_PTR(min_initial_exposure_time);
+        OPT_PTR(max_initial_exposure_time);
     }
 };
 
@@ -1197,8 +1217,8 @@ extern const CLIMiscConfigDef       cli_misc_config_def;
 class DynamicPrintAndCLIConfig : public DynamicPrintConfig
 {
 public:
-	DynamicPrintAndCLIConfig() {}
-	DynamicPrintAndCLIConfig(const DynamicPrintAndCLIConfig &other) : DynamicPrintConfig(other) {}
+    DynamicPrintAndCLIConfig() {}
+    DynamicPrintAndCLIConfig(const DynamicPrintAndCLIConfig &other) : DynamicPrintConfig(other) {}
 
     // Overrides ConfigBase::def(). Static configuration definition. Any value stored into this ConfigBase shall have its definition here.
     const ConfigDef*        def() const override { return &s_def; }
@@ -1219,7 +1239,7 @@ private:
             this->options.insert(cli_transform_config_def.options.begin(), cli_transform_config_def.options.end());
             this->options.insert(cli_misc_config_def.options.begin(), cli_misc_config_def.options.end());
             for (const auto &kvp : this->options)
-            	this->by_serialization_key_ordinal[kvp.second.serialization_key_ordinal] = &kvp.second;
+                this->by_serialization_key_ordinal[kvp.second.serialization_key_ordinal] = &kvp.second;
         }
         // Do not release the default values, they are handled by print_config_def & cli_actions_config_def / cli_transform_config_def / cli_misc_config_def.
         ~PrintAndCLIConfigDef() { this->options.clear(); }
@@ -1231,36 +1251,36 @@ private:
 
 // Serialization through the Cereal library
 namespace cereal {
-	// Let cereal know that there are load / save non-member functions declared for DynamicPrintConfig, ignore serialize / load / save from parent class DynamicConfig.
-	template <class Archive> struct specialize<Archive, Slic3r::DynamicPrintConfig, cereal::specialization::non_member_load_save> {};
+    // Let cereal know that there are load / save non-member functions declared for DynamicPrintConfig, ignore serialize / load / save from parent class DynamicConfig.
+    template <class Archive> struct specialize<Archive, Slic3r::DynamicPrintConfig, cereal::specialization::non_member_load_save> {};
 
-	template<class Archive> void load(Archive& archive, Slic3r::DynamicPrintConfig &config) 
-	{
-		size_t cnt;
-		archive(cnt);
-		config.clear();
-		for (size_t i = 0; i < cnt; ++ i) {
-			size_t serialization_key_ordinal;
-			archive(serialization_key_ordinal);
-			assert(serialization_key_ordinal > 0);
-			auto it = Slic3r::print_config_def.by_serialization_key_ordinal.find(serialization_key_ordinal);
-			assert(it != Slic3r::print_config_def.by_serialization_key_ordinal.end());
-			config.set_key_value(it->second->opt_key, it->second->load_option_from_archive(archive));
-		}
-	}
+    template<class Archive> void load(Archive& archive, Slic3r::DynamicPrintConfig &config)
+    {
+        size_t cnt;
+        archive(cnt);
+        config.clear();
+        for (size_t i = 0; i < cnt; ++ i) {
+            size_t serialization_key_ordinal;
+            archive(serialization_key_ordinal);
+            assert(serialization_key_ordinal > 0);
+            auto it = Slic3r::print_config_def.by_serialization_key_ordinal.find(serialization_key_ordinal);
+            assert(it != Slic3r::print_config_def.by_serialization_key_ordinal.end());
+            config.set_key_value(it->second->opt_key, it->second->load_option_from_archive(archive));
+        }
+    }
 
-	template<class Archive> void save(Archive& archive, const Slic3r::DynamicPrintConfig &config)
-	{
-		size_t cnt = config.size();
-		archive(cnt);
-		for (auto it = config.cbegin(); it != config.cend(); ++it) {
-			const Slic3r::ConfigOptionDef* optdef = Slic3r::print_config_def.get(it->first);
-			assert(optdef != nullptr);
-			assert(optdef->serialization_key_ordinal > 0);
-			archive(optdef->serialization_key_ordinal);
-			optdef->save_option_to_archive(archive, it->second.get());
-		}
-	}
+    template<class Archive> void save(Archive& archive, const Slic3r::DynamicPrintConfig &config)
+    {
+        size_t cnt = config.size();
+        archive(cnt);
+        for (auto it = config.cbegin(); it != config.cend(); ++it) {
+            const Slic3r::ConfigOptionDef* optdef = Slic3r::print_config_def.get(it->first);
+            assert(optdef != nullptr);
+            assert(optdef->serialization_key_ordinal > 0);
+            archive(optdef->serialization_key_ordinal);
+            optdef->save_option_to_archive(archive, it->second.get());
+        }
+    }
 }
 
 #endif

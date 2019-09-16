@@ -66,13 +66,20 @@ struct ItemForDelete
 
 class ObjectList : public wxDataViewCtrl
 {
+public:
     enum SELECTION_MODE
     {
         smUndef     = 0,
         smVolume    = 1,
         smInstance  = 2,
-        smLayer     = 4
-    } m_selection_mode {smUndef};
+        smLayer     = 4,
+        smSettings  = 8,  // used for undo/redo
+        smLayerRoot = 16, // used for undo/redo
+    };
+
+private:
+    SELECTION_MODE  m_selection_mode {smUndef};
+    int             m_selected_layers_range_idx;
 
     struct dragged_item_data
     {
@@ -150,6 +157,10 @@ class ObjectList : public wxDataViewCtrl
 
     int         m_selected_row = 0;
     wxDataViewItem m_last_selected_item {nullptr};
+#ifdef __WXMSW__
+    // Workaround for entering the column editing mode on Windows. Simulate keyboard enter when another column of the active line is selected.
+    int 	    m_last_selected_column = -1;
+#endif /* __MSW__ */
 
 #if 0
     SettingsBundle m_freq_settings_fff;
@@ -218,6 +229,7 @@ public:
     wxMenuItem*         append_menu_item_settings(wxMenu* menu);
     wxMenuItem*         append_menu_item_change_type(wxMenu* menu);
     wxMenuItem*         append_menu_item_instance_to_object(wxMenu* menu, wxWindow* parent);
+    wxMenuItem*         append_menu_item_printable(wxMenu* menu, wxWindow* parent);
     void                append_menu_items_osx(wxMenu* menu);
     wxMenuItem*         append_menu_item_fix_through_netfabb(wxMenu* menu);
     void                append_menu_item_export_stl(wxMenu* menu) const ;
@@ -229,9 +241,9 @@ public:
     void                create_part_popupmenu(wxMenu*menu);
     void                create_instance_popupmenu(wxMenu*menu);
     wxMenu*             create_settings_popupmenu(wxMenu *parent_menu);
-    void                create_freq_settings_popupmenu(wxMenu *parent_menu);
+    void                create_freq_settings_popupmenu(wxMenu *parent_menu, const bool is_object_settings = true);
 
-    void                update_opt_keys(t_config_option_keys& t_optopt_keys);
+    void                update_opt_keys(t_config_option_keys& t_optopt_keys, const bool is_object);
 
     void                load_subobject(ModelVolumeType type);
     void                load_part(ModelObject* model_object, std::vector<std::pair<wxString, bool>> &volumes_info, ModelVolumeType type);
@@ -259,7 +271,7 @@ public:
     wxBoxSizer*         get_sizer() {return  m_sizer;}
     int                 get_selected_obj_idx() const;
     DynamicPrintConfig& get_item_config(const wxDataViewItem& item) const;
-    SettingsBundle      get_item_settings_bundle(const DynamicPrintConfig* config, const bool is_layers_range_settings);
+    SettingsBundle      get_item_settings_bundle(const DynamicPrintConfig* config, const bool is_object_settings);
 
     void                changed_object(const int obj_idx = -1) const;
     void                part_selection_changed();
@@ -302,6 +314,9 @@ public:
     void init_objects();
     bool multiple_selection() const ;
     bool is_selected(const ItemType type) const;
+    int  get_selected_layers_range_idx() const;
+    void set_selected_layers_range_idx(const int range_idx) { m_selected_layers_range_idx = range_idx; }
+    void set_selection_mode(SELECTION_MODE mode) { m_selection_mode = mode; }
     void update_selections();
     void update_selections_on_canvas();
     void select_item(const wxDataViewItem& item);
@@ -317,7 +332,6 @@ public:
     void change_part_type();
 
     void last_volume_is_deleted(const int obj_idx);
-    bool has_multi_part_objects();
     void update_settings_items();
     void update_and_show_object_settings_item();
     void update_settings_item_and_selection(wxDataViewItem item, wxDataViewItemArray& selections);
@@ -339,12 +353,16 @@ public:
     void msw_rescale();
 
     void update_after_undo_redo();
+    //update printable state for item from objects model
+    void update_printable_state(int obj_idx, int instance_idx);
+    void toggle_printable_state(wxDataViewItem item);
 
 private:
 #ifdef __WXOSX__
 //    void OnChar(wxKeyEvent& event);
 #endif /* __WXOSX__ */
     void OnContextMenu(wxDataViewEvent &event);
+    void list_manipulation();
 
     void OnBeginDrag(wxDataViewEvent &event);
     void OnDropPossible(wxDataViewEvent &event);
@@ -352,6 +370,10 @@ private:
     bool can_drop(const wxDataViewItem& item) const ;
 
     void ItemValueChanged(wxDataViewEvent &event);
+#ifdef __WXMSW__
+    // Workaround for entering the column editing mode on Windows. Simulate keyboard enter when another column of the active line is selected.
+	void OnEditingStarted(wxDataViewEvent &event);
+#endif /* __WXMSW__ */
     void OnEditingDone(wxDataViewEvent &event);
 
     void show_multi_selection_menu();

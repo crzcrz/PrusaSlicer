@@ -9,6 +9,11 @@
 #include <map>
 
 namespace Slic3r {
+
+namespace UndoRedo {
+struct Snapshot;
+}
+
 namespace GUI {
 
 class GLCanvas3D;
@@ -108,11 +113,15 @@ public:
         ar(m_current);
 
         GLGizmoBase* curr = get_current();
-        if (curr != nullptr)
-        {
-            curr->set_state(GLGizmoBase::On);
-            curr->load(ar);
-        }
+		for (GizmosMap::const_iterator it = m_gizmos.begin(); it != m_gizmos.end(); ++it) {
+			GLGizmoBase* gizmo = it->second;
+			if (gizmo != nullptr) {
+				gizmo->set_hover_id(-1);
+				gizmo->set_state((it->second == curr) ? GLGizmoBase::On : GLGizmoBase::Off);
+				if (gizmo == curr)
+					gizmo->load(ar);
+			}
+		}
     }
 
     template<class Archive>
@@ -169,6 +178,7 @@ public:
     void set_sla_support_data(ModelObject* model_object);
     bool gizmo_event(SLAGizmoEventType action, const Vec2d& mouse_position = Vec2d::Zero(), bool shift_down = false, bool alt_down = false, bool control_down = false);
     ClippingPlane get_sla_clipping_plane() const;
+    bool wants_reslice_supports_on_undo() const;
 
     void render_current_gizmo() const;
     void render_current_gizmo_for_picking_pass() const;
@@ -182,11 +192,12 @@ public:
     bool on_char(wxKeyEvent& evt);
     bool on_key(wxKeyEvent& evt);
 
-    void update_after_undo_redo();
+    void update_after_undo_redo(const UndoRedo::Snapshot& snapshot);
 
 private:
     void reset();
 
+    void render_background(float left, float top, float right, float bottom, float border) const;
     void do_render_overlay() const;
 
     float get_total_overlay_height() const;

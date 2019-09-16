@@ -25,7 +25,7 @@ static double get_volume_min_z(const GLVolume* volume)
     const Transform3f& world_matrix = volume->world_matrix().cast<float>();
 
     // need to get the ModelVolume pointer
-    const ModelObject* mo = wxGetApp().model_objects()->at(volume->composite_id.object_id);
+    const ModelObject* mo = wxGetApp().model().objects[volume->composite_id.object_id];
     const ModelVolume* mv = mo->volumes[volume->composite_id.volume_id];
     const TriangleMesh& hull = mv->get_convex_hull();
 
@@ -153,8 +153,8 @@ ObjectManipulation::ObjectManipulation(wxWindow* parent) :
 
     auto manifold_warning_icon = [this](wxWindow* parent) {
         m_fix_throught_netfab_bitmap = new wxStaticBitmap(parent, wxID_ANY, wxNullBitmap);
-        auto sizer = new wxBoxSizer(wxHORIZONTAL);
-        sizer->Add(m_fix_throught_netfab_bitmap);
+//         auto sizer = new wxBoxSizer(wxHORIZONTAL);
+//         sizer->Add(m_fix_throught_netfab_bitmap);
 
         if (is_windows10())
             m_fix_throught_netfab_bitmap->Bind(wxEVT_CONTEXT_MENU, [this](wxCommandEvent &e)
@@ -167,17 +167,19 @@ ObjectManipulation::ObjectManipulation(wxWindow* parent) :
                 update_warning_icon_state(wxGetApp().obj_list()->get_mesh_errors_list());
             });
 
-        return sizer;
+//         return sizer;
+        return m_fix_throught_netfab_bitmap;
     };
 
-    line.append_widget(manifold_warning_icon);
+ //   line.append_widget(manifold_warning_icon);
+    line.near_label_widget = manifold_warning_icon;
     def.label = "";
     def.gui_type = "legend";
     def.tooltip = L("Object name");
 #ifdef __APPLE__
-    def.width = 19;
+    def.width = 20;
 #else
-    def.width = 21;
+    def.width = 22;
 #endif
     def.set_default_value(new ConfigOptionString{ " " });
     line.append_option(Option(def, "object_name"));
@@ -195,22 +197,22 @@ ObjectManipulation::ObjectManipulation(wxWindow* parent) :
     def.width = field_width - mirror_btn_width;//field_width/*50*/;
 
     // Load bitmaps to be used for the mirroring buttons:
-    m_mirror_bitmap_on  = ScalableBitmap(parent, "mirroring_on.png");
-    m_mirror_bitmap_off = ScalableBitmap(parent, "mirroring_off.png");
+    m_mirror_bitmap_on  = ScalableBitmap(parent, "mirroring_on");
+    m_mirror_bitmap_off = ScalableBitmap(parent, "mirroring_off");
     m_mirror_bitmap_hidden = ScalableBitmap(parent, "mirroring_transparent.png");
 
-	for (const std::string axis : { "x", "y", "z" }) {
-        const std::string label = boost::algorithm::to_upper_copy(axis);
-        def.set_default_value(new ConfigOptionString{ "   " + label });
-        Option option = Option(def, axis + "_axis_legend");
-
-        unsigned int axis_idx = (axis[0] - 'x'); // 0, 1 or 2
+    static const char axes[] = { 'X', 'Y', 'Z' };
+    for (size_t axis_idx = 0; axis_idx < sizeof(axes); axis_idx++) {
+        const char label = axes[axis_idx];
+        def.set_default_value(new ConfigOptionString{ std::string("   ") + label });
+        Option option(def, std::string() + label + "_axis_legend");
 
         // We will add a button to toggle mirroring to each axis:
-        auto mirror_button = [this, mirror_btn_width, axis_idx, &label](wxWindow* parent) {
+        auto mirror_button = [this, mirror_btn_width, axis_idx, label](wxWindow* parent) {
             wxSize btn_size(em_unit(parent) * mirror_btn_width, em_unit(parent) * mirror_btn_width);
-            auto btn = new ScalableButton(parent, wxID_ANY, "mirroring_off.png", wxEmptyString, btn_size, wxDefaultPosition, wxBU_EXACTFIT | wxNO_BORDER | wxTRANSPARENT_WINDOW);
-            btn->SetToolTip(wxString::Format(_(L("Toggle %s axis mirroring")), label));
+            auto btn = new ScalableButton(parent, wxID_ANY, "mirroring_off", wxEmptyString, btn_size, wxDefaultPosition, wxBU_EXACTFIT | wxNO_BORDER | wxTRANSPARENT_WINDOW);
+            btn->SetToolTip(wxString::Format(_(L("Toggle %c axis mirroring")), (int)label));
+            btn->SetBitmapDisabled_(m_mirror_bitmap_hidden);
 
             m_mirror_buttons[axis_idx].first = btn;
             m_mirror_buttons[axis_idx].second = mbShown;
@@ -245,7 +247,8 @@ ObjectManipulation::ObjectManipulation(wxWindow* parent) :
                 canvas->do_mirror(L("Set Mirror"));
                 UpdateAndShow(true);
             });
-        return sizer;
+
+            return sizer;
         };
 
         option.side_widget = mirror_button;
@@ -286,6 +289,7 @@ ObjectManipulation::ObjectManipulation(wxWindow* parent) :
                 auto sizer = new wxBoxSizer(wxHORIZONTAL);
                 sizer->Add(btn, wxBU_EXACTFIT);
                 btn->Bind(wxEVT_BUTTON, [this](wxCommandEvent &e) {
+                    Plater::TakeSnapshot snapshot(wxGetApp().plater(), _(L("Reset scale")));
                     change_scale_value(0, 100.);
                     change_scale_value(1, 100.);
                     change_scale_value(2, 100.);
@@ -323,7 +327,7 @@ ObjectManipulation::ObjectManipulation(wxWindow* parent) :
                     selection.synchronize_unselected_instances(Selection::SYNC_ROTATION_GENERAL);
                     selection.synchronize_unselected_volumes();
                     // Copy rotation values from GLVolumes into Model (ModelInstance / ModelVolume), trigger background processing.
-                    canvas->do_rotate(L("Set Rotation"));
+                    canvas->do_rotate(L("Reset Rotation"));
 
                     UpdateAndShow(true);
                 });
@@ -334,7 +338,7 @@ ObjectManipulation::ObjectManipulation(wxWindow* parent) :
         else if (option_name == "Position") {
             // Add drop to bed button
             auto drop_to_bed_button = [=](wxWindow* parent) {
-                auto btn = new ScalableButton(parent, wxID_ANY, ScalableBitmap(parent, "drop_to_bed.png"));
+                auto btn = new ScalableButton(parent, wxID_ANY, ScalableBitmap(parent, "drop_to_bed"));
                 btn->SetToolTip(_(L("Drop to bed")));
                 m_drop_to_bed_button = btn;
                 auto sizer = new wxBoxSizer(wxHORIZONTAL);
@@ -350,6 +354,7 @@ ObjectManipulation::ObjectManipulation(wxWindow* parent) :
                         const Geometry::Transformation& instance_trafo = volume->get_instance_transformation();
                         Vec3d diff = m_cache.position - instance_trafo.get_matrix(true).inverse() * Vec3d(0., 0., get_volume_min_z(volume));
 
+                        Plater::TakeSnapshot snapshot(wxGetApp().plater(), _(L("Drop to bed")));
                         change_position_value(0, diff.x());
                         change_position_value(1, diff.y());
                         change_position_value(2, diff.z());
@@ -389,10 +394,19 @@ ObjectManipulation::ObjectManipulation(wxWindow* parent) :
 
     // call back for a rescale of button "Set uniform scale"
     m_og->rescale_near_label_widget = [this](wxWindow* win) {
+        // rescale lock icon
         auto *ctrl = dynamic_cast<LockButton*>(win);
-        if (ctrl == nullptr)
+        if (ctrl != nullptr) {
+            ctrl->msw_rescale();
             return;
-        ctrl->msw_rescale();
+        }
+
+        if (win == m_fix_throught_netfab_bitmap)
+            return;
+
+        // rescale "place" of the empty icon (to correct layout of the "Size" and "Scale")
+        if (dynamic_cast<wxStaticBitmap*>(win) != nullptr)
+            win->SetMinSize(create_scaled_bitmap(m_parent, "one_layer_lock_on.png").GetSize());
     };
 }
  
@@ -466,7 +480,7 @@ void ObjectManipulation::update_settings_value(const Selection& selection)
 			m_new_scale    = m_new_size.cwiseProduct(selection.get_unscaled_instance_bounding_box().size().cwiseInverse()) * 100.;
 		} else {
 			m_new_rotation = volume->get_instance_rotation() * (180. / M_PI);
-			m_new_size     = volume->get_instance_transformation().get_scaling_factor().cwiseProduct((*wxGetApp().model_objects())[volume->object_idx()]->raw_mesh_bounding_box().size());
+			m_new_size     = volume->get_instance_transformation().get_scaling_factor().cwiseProduct(wxGetApp().model().objects[volume->object_idx()]->raw_mesh_bounding_box().size());
 			m_new_scale    = volume->get_instance_scaling_factor() * 100.;
 		}
 
@@ -548,7 +562,7 @@ void ObjectManipulation::update_if_dirty()
 
     if (selection.requires_uniform_scale()) {
         m_lock_bnt->SetLock(true);
-        m_lock_bnt->SetToolTip(_(L("You cann't use non-uniform scaling mode for multiple objects/parts selection")));
+        m_lock_bnt->SetToolTip(_(L("You cannot use non-uniform scaling mode for multiple objects/parts selection")));
         m_lock_bnt->disable();
     }
     else {
@@ -611,6 +625,14 @@ void ObjectManipulation::update_reset_buttons_visibility()
         m_reset_rotation_button->Show(show_rotation);
         m_reset_scale_button->Show(show_scale);
         m_drop_to_bed_button->Show(show_drop_to_bed);
+
+        // Because of CallAfter we need to layout sidebar after Show/hide of reset buttons one more time
+        Sidebar& panel = wxGetApp().sidebar();
+        if (!panel.IsFrozen()) {
+            panel.Freeze();
+            panel.Layout();
+            panel.Thaw();
+        }
     });
 }
 
@@ -646,13 +668,13 @@ void ObjectManipulation::update_mirror_buttons_visibility()
     wxGetApp().CallAfter([this, new_states]{
         for (int i=0; i<3; ++i) {
             if (new_states[i] != m_mirror_buttons[i].second) {
-                const wxBitmap* bmp;
+                const ScalableBitmap* bmp;
                 switch (new_states[i]) {
-                    case mbHidden : bmp = &m_mirror_bitmap_hidden.bmp(); m_mirror_buttons[i].first->Enable(false); break;
-                    case mbShown  : bmp = &m_mirror_bitmap_off.bmp(); m_mirror_buttons[i].first->Enable(true); break;
-                    case mbActive : bmp = &m_mirror_bitmap_on.bmp(); m_mirror_buttons[i].first->Enable(true); break;
+                    case mbHidden : bmp = &m_mirror_bitmap_hidden; m_mirror_buttons[i].first->Enable(false); break;
+                    case mbShown  : bmp = &m_mirror_bitmap_off; m_mirror_buttons[i].first->Enable(true); break;
+                    case mbActive : bmp = &m_mirror_bitmap_on; m_mirror_buttons[i].first->Enable(true); break;
                 }
-                m_mirror_buttons[i].first->SetBitmap(*bmp);
+                m_mirror_buttons[i].first->SetBitmap_(*bmp);
                 m_mirror_buttons[i].second = new_states[i];
             }
         }
@@ -682,6 +704,7 @@ void ObjectManipulation::emulate_kill_focus()
 void ObjectManipulation::update_warning_icon_state(const wxString& tooltip)
 {
     m_fix_throught_netfab_bitmap->SetBitmap(tooltip.IsEmpty() ? wxNullBitmap : m_manifold_warning_bmp.bmp());
+    m_fix_throught_netfab_bitmap->SetMinSize(tooltip.IsEmpty() ? wxSize(0,0) : m_manifold_warning_bmp.bmp().GetSize());
     m_fix_throught_netfab_bitmap->SetToolTip(tooltip);
 }
 
@@ -779,7 +802,7 @@ void ObjectManipulation::change_size_value(int axis, double value)
     else if (selection.is_single_full_instance())
 		ref_size = m_world_coordinates ? 
             selection.get_unscaled_instance_bounding_box().size() :
-            (*wxGetApp().model_objects())[selection.get_volume(*selection.get_volume_idxs().begin())->object_idx()]->raw_mesh_bounding_box().size();
+            wxGetApp().model().objects[selection.get_volume(*selection.get_volume_idxs().begin())->object_idx()]->raw_mesh_bounding_box().size();
 
     this->do_scale(axis, 100. * Vec3d(size(0) / ref_size(0), size(1) / ref_size(1), size(2) / ref_size(2)));
 
@@ -902,7 +925,7 @@ void ObjectManipulation::set_uniform_scaling(const bool new_value)
                 return;
             }
             // Bake the rotation into the meshes of the object.
-            (*wxGetApp().model_objects())[volume->composite_id.object_id]->bake_xy_rotation_into_meshes(volume->composite_id.instance_id);
+            wxGetApp().model().objects[volume->composite_id.object_id]->bake_xy_rotation_into_meshes(volume->composite_id.instance_id);
             // Update the 3D scene, selections etc.
             wxGetApp().plater()->update();
             // Recalculate cached values at this panel, refresh the screen.
@@ -916,7 +939,10 @@ void ObjectManipulation::msw_rescale()
 {
     msw_rescale_word_local_combo(m_word_local_combo);
     m_manifold_warning_bmp.msw_rescale();
-    m_fix_throught_netfab_bitmap->SetBitmap(m_manifold_warning_bmp.bmp());
+
+    const wxString& tooltip = m_fix_throught_netfab_bitmap->GetToolTipText();
+    m_fix_throught_netfab_bitmap->SetBitmap(tooltip.IsEmpty() ? wxNullBitmap : m_manifold_warning_bmp.bmp());
+    m_fix_throught_netfab_bitmap->SetMinSize(tooltip.IsEmpty() ? wxSize(0, 0) : m_manifold_warning_bmp.bmp().GetSize());
 
     m_mirror_bitmap_on.msw_rescale();
     m_mirror_bitmap_off.msw_rescale();
@@ -924,6 +950,9 @@ void ObjectManipulation::msw_rescale()
     m_reset_scale_button->msw_rescale();
     m_reset_rotation_button->msw_rescale();
     m_drop_to_bed_button->msw_rescale();
+
+    for (int id = 0; id < 3; ++id)
+        m_mirror_buttons[id].first->msw_rescale();
 
     get_og()->msw_rescale();
 }

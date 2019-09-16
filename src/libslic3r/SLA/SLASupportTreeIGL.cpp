@@ -12,10 +12,18 @@
 #include "SLABoostAdapter.hpp"
 #include "boost/geometry/index/rtree.hpp"
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4244)
+#pragma warning(disable: 4267)
+#endif
 #include <igl/ray_mesh_intersect.h>
 #include <igl/point_mesh_squared_distance.h>
 #include <igl/remove_duplicate_vertices.h>
 #include <igl/signed_distance.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 #include <tbb/parallel_for.h>
 
@@ -140,9 +148,9 @@ std::vector<BoxIndexEl> BoxIndex::query(const BoundingBox &qrbb,
                                         BoxIndex::QueryType qt)
 {
     namespace bgi = boost::geometry::index;
-    
+
     std::vector<BoxIndexEl> ret; ret.reserve(m_impl->m_store.size());
-    
+
     switch (qt) {
     case qtIntersects:
         m_impl->m_store.query(bgi::intersects(qrbb), std::back_inserter(ret));
@@ -150,7 +158,7 @@ std::vector<BoxIndexEl> BoxIndex::query(const BoundingBox &qrbb,
     case qtWithin:
         m_impl->m_store.query(bgi::within(qrbb), std::back_inserter(ret));
     }
-    
+
     return ret;
 }
 
@@ -190,9 +198,9 @@ EigenMesh3D::EigenMesh3D(const TriangleMesh& tmesh): m_aabb(new AABBImpl()) {
     F.resize(stl.stats.number_of_facets, 3);
     for (unsigned int i = 0; i < stl.stats.number_of_facets; ++i) {
         const stl_facet &facet = stl.facet_start[i];
-		V.block<1, 3>(3 * i + 0, 0) = facet.vertex[0].cast<double>();
-		V.block<1, 3>(3 * i + 1, 0) = facet.vertex[1].cast<double>();
-		V.block<1, 3>(3 * i + 2, 0) = facet.vertex[2].cast<double>();
+        V.block<1, 3>(3 * i + 0, 0) = facet.vertex[0].cast<double>();
+        V.block<1, 3>(3 * i + 1, 0) = facet.vertex[1].cast<double>();
+        V.block<1, 3>(3 * i + 2, 0) = facet.vertex[2].cast<double>();
         F(i, 0) = int(3*i+0);
         F(i, 1) = int(3*i+1);
         F(i, 2) = int(3*i+2);
@@ -298,6 +306,7 @@ PointSet normals(const PointSet& points,
 
     PointSet            ret(range.size(), 3);
 
+//    for (size_t ridx = 0; ridx < range.size(); ++ridx)
     tbb::parallel_for(size_t(0), range.size(),
                       [&ret, &range, &mesh, &points, thr, eps](size_t ridx)
     {

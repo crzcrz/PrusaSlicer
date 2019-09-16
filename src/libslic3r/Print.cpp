@@ -18,6 +18,7 @@
 #include <limits>
 #include <unordered_set>
 #include <boost/filesystem/path.hpp>
+#include <boost/format.hpp>
 #include <boost/log/trivial.hpp>
 
 //! macro used to mark string used at localization,
@@ -261,8 +262,14 @@ std::vector<unsigned int> Print::object_extruders() const
 {
     std::vector<unsigned int> extruders;
     extruders.reserve(m_regions.size() * 3);
-    for (const PrintRegion *region : m_regions)
-        region->collect_object_printing_extruders(extruders);
+    std::vector<unsigned char> region_used(m_regions.size(), false);
+    for (const PrintObject *object : m_objects)
+		for (const std::vector<std::pair<t_layer_height_range, int>> &volumes_per_region : object->region_volumes)
+        	if (! volumes_per_region.empty())
+        		region_used[&volumes_per_region - &object->region_volumes.front()] = true;
+    for (size_t idx_region = 0; idx_region < m_regions.size(); ++ idx_region)
+    	if (region_used[idx_region])
+        	m_regions[idx_region]->collect_object_printing_extruders(extruders);
     sort_remove_duplicates(extruders);
     return extruders;
 }
@@ -272,17 +279,24 @@ std::vector<unsigned int> Print::support_material_extruders() const
 {
     std::vector<unsigned int> extruders;
     bool support_uses_current_extruder = false;
+    auto num_extruders = (unsigned int)m_config.nozzle_diameter.size();
 
     for (PrintObject *object : m_objects) {
         if (object->has_support_material()) {
+        	assert(object->config().support_material_extruder >= 0);
             if (object->config().support_material_extruder == 0)
                 support_uses_current_extruder = true;
-            else
-                extruders.push_back(object->config().support_material_extruder - 1);
+            else {
+            	unsigned int i = (unsigned int)object->config().support_material_extruder - 1;
+                extruders.emplace_back((i >= num_extruders) ? 0 : i);
+            }
+        	assert(object->config().support_material_interface_extruder >= 0);
             if (object->config().support_material_interface_extruder == 0)
                 support_uses_current_extruder = true;
-            else
-                extruders.push_back(object->config().support_material_interface_extruder - 1);
+            else {
+            	unsigned int i = (unsigned int)object->config().support_material_interface_extruder - 1;
+                extruders.emplace_back((i >= num_extruders) ? 0 : i);
+            }
         }
     }
 
@@ -485,25 +499,82 @@ bool layer_height_ranges_equal(const t_layer_config_ranges &lr1, const t_layer_c
     return true;
 }
 
-Print::ApplyStatus Print::apply(const Model &model, const DynamicPrintConfig &config_in)
+// Collect diffs of configuration values at various containers,
+// resolve the filament rectract overrides of extruder retract values.
+void Print::config_diffs(
+	const DynamicPrintConfig &new_full_config, 
+	t_config_option_keys &print_diff, t_config_option_keys &object_diff, t_config_option_keys &region_diff, 
+	t_config_option_keys &full_config_diff, 
+	DynamicPrintConfig &placeholder_parser_overrides,
+	DynamicPrintConfig &filament_overrides) const
+{
+    // Collect changes to print config, account for overrides of extruder retract values by filament presets.
+    {
+	    const std::vector<std::string> &extruder_retract_keys = print_config_def.extruder_retract_keys();
+	    const std::string               filament_prefix       = "filament_";
+	    for (const t_config_option_key &opt_key : m_config.keys()) {
+	        const ConfigOption *opt_old = m_config.option(opt_key);
+	        assert(opt_old != nullptr);
+	        const ConfigOption *opt_new = new_full_config.option(opt_key);
+			// assert(opt_new != nullptr);
+			if (opt_new == nullptr)
+				//FIXME This may happen when executing some test cases.
+				continue;
+	        const ConfigOption *opt_new_filament = std::binary_search(extruder_retract_keys.begin(), extruder_retract_keys.end(), opt_key) ? new_full_config.option(filament_prefix + opt_key) : nullptr;
+	        if (opt_new_filament != nullptr && ! opt_new_filament->is_nil()) {
+	        	// An extruder retract override is available at some of the filament presets.
+	        	if (*opt_old != *opt_new || opt_new->overriden_by(opt_new_filament)) {
+	        		auto opt_copy = opt_new->clone();
+	        		opt_copy->apply_override(opt_new_filament);
+	        		if (*opt_old == *opt_copy)
+	        			delete opt_copy;
+	        		else {
+	        			filament_overrides.set_key_value(opt_key, opt_copy);
+	        			print_diff.emplace_back(opt_key);
+	        		}
+	        	}
+	        } else if (*opt_new != *opt_old)
+	            print_diff.emplace_back(opt_key);
+	    }
+	}
+	// Collect changes to object and region configs.
+    object_diff = m_default_object_config.diff(new_full_config);
+    region_diff = m_default_region_config.diff(new_full_config);
+    // Prepare for storing of the full print config into new_full_config to be exported into the G-code and to be used by the PlaceholderParser.
+    // As the PlaceholderParser does not interpret the FloatOrPercent values itself, these values are stored into the PlaceholderParser converted to floats.
+    for (const t_config_option_key &opt_key : new_full_config.keys()) {
+        const ConfigOption *opt_old = m_full_print_config.option(opt_key);
+        const ConfigOption *opt_new = new_full_config.option(opt_key);
+        if (opt_old == nullptr || *opt_new != *opt_old)
+            full_config_diff.emplace_back(opt_key);
+        if (opt_new->type() == coFloatOrPercent) {
+        	// The m_placeholder_parser is never modified by the background processing, GCode.cpp/hpp makes a copy.
+	        const ConfigOption *opt_old_pp = this->placeholder_parser().config().option(opt_key);
+	        double new_value = new_full_config.get_abs_value(opt_key);
+	        if (opt_old_pp == nullptr || static_cast<const ConfigOptionFloat*>(opt_old_pp)->value != new_value)
+	        	placeholder_parser_overrides.set_key_value(opt_key, new ConfigOptionFloat(new_value));
+		}
+    }
+}
+
+Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_config)
 {
 #ifdef _DEBUG
     check_model_ids_validity(model);
 #endif /* _DEBUG */
 
-    // Make a copy of the config, normalize it.
-    DynamicPrintConfig config(config_in);
-	config.option("print_settings_id",    true);
-	config.option("filament_settings_id", true);
-	config.option("printer_settings_id",  true);
-    config.normalize();
-    // Collect changes to print config.
-    t_config_option_keys print_diff  = m_config.diff(config);
-    t_config_option_keys object_diff = m_default_object_config.diff(config);
-    t_config_option_keys region_diff = m_default_region_config.diff(config);
-    t_config_option_keys placeholder_parser_diff = this->placeholder_parser().config_diff(config);
+    // Normalize the config.
+	new_full_config.option("print_settings_id",    true);
+	new_full_config.option("filament_settings_id", true);
+	new_full_config.option("printer_settings_id",  true);
+    new_full_config.normalize();
 
-    // Do not use the ApplyStatus as we will use the max function when updating apply_status. 
+    // Find modified keys of the various configs. Resolve overrides extruder retract values by filament profiles.
+	t_config_option_keys print_diff, object_diff, region_diff, full_config_diff;
+	DynamicPrintConfig placeholder_parser_overrides, filament_overrides;
+	this->config_diffs(new_full_config, print_diff, object_diff, region_diff, full_config_diff, placeholder_parser_overrides, filament_overrides);
+
+    // Do not use the ApplyStatus as we will use the max function when updating apply_status.
     unsigned int apply_status = APPLY_STATUS_UNCHANGED;
     auto update_apply_status = [&apply_status](bool invalidated)
         { apply_status = std::max<unsigned int>(apply_status, invalidated ? APPLY_STATUS_INVALIDATED : APPLY_STATUS_CHANGED); };
@@ -516,24 +587,31 @@ Print::ApplyStatus Print::apply(const Model &model, const DynamicPrintConfig &co
     // The following call may stop the background processing.
     if (! print_diff.empty())
         update_apply_status(this->invalidate_state_by_config_options(print_diff));
+
     // Apply variables to placeholder parser. The placeholder parser is used by G-code export,
     // which should be stopped if print_diff is not empty.
-	if (! placeholder_parser_diff.empty()) {
+    size_t num_extruders = m_config.nozzle_diameter.size();
+    bool   num_extruders_changed = false;
+    if (! full_config_diff.empty() || ! placeholder_parser_overrides.empty()) {
         update_apply_status(this->invalidate_step(psGCodeExport));
-		PlaceholderParser &pp = this->placeholder_parser();
-		pp.apply_only(config, placeholder_parser_diff);
+		m_placeholder_parser.apply_config(std::move(placeholder_parser_overrides));
         // Set the profile aliases for the PrintBase::output_filename()
-		pp.set("print_preset",    config.option("print_settings_id")->clone());
-		pp.set("filament_preset", config.option("filament_settings_id")->clone());
-		pp.set("printer_preset",  config.option("printer_settings_id")->clone());
+		m_placeholder_parser.set("print_preset",    new_full_config.option("print_settings_id")->clone());
+		m_placeholder_parser.set("filament_preset", new_full_config.option("filament_settings_id")->clone());
+		m_placeholder_parser.set("printer_preset",  new_full_config.option("printer_settings_id")->clone());
+	    // It is also safe to change m_config now after this->invalidate_state_by_config_options() call.
+	    m_config.apply_only(new_full_config, print_diff, true);
+	    m_config.apply(filament_overrides);
+	    // Handle changes to object config defaults
+	    m_default_object_config.apply_only(new_full_config, object_diff, true);
+	    // Handle changes to regions config defaults
+	    m_default_region_config.apply_only(new_full_config, region_diff, true);
+        m_full_print_config = std::move(new_full_config);
+        if (num_extruders != m_config.nozzle_diameter.size()) {
+        	num_extruders = m_config.nozzle_diameter.size();
+        	num_extruders_changed = true;
+        }
     }
-
-    // It is also safe to change m_config now after this->invalidate_state_by_config_options() call.
-    m_config.apply_only(config, print_diff, true);
-    // Handle changes to object config defaults
-    m_default_object_config.apply_only(config, object_diff, true);
-    // Handle changes to regions config defaults
-    m_default_region_config.apply_only(config, region_diff, true);
     
     class LayerRanges
     {
@@ -545,9 +623,8 @@ Print::ApplyStatus Print::apply(const Model &model, const DynamicPrintConfig &co
             m_ranges.reserve(in.size());
             // Input ranges are sorted lexicographically. First range trims the other ranges.
             coordf_t last_z = 0;
-            for (const std::pair<const t_layer_height_range, DynamicPrintConfig> &range : in) {
-//            for (auto &range : in) {
-			if (range.first.second > last_z) {
+            for (const std::pair<const t_layer_height_range, DynamicPrintConfig> &range : in)
+				if (range.first.second > last_z) {
                     coordf_t min_z = std::max(range.first.first, 0.);
                     if (min_z > last_z + EPSILON) {
                         m_ranges.emplace_back(t_layer_height_range(last_z, min_z), nullptr);
@@ -559,7 +636,6 @@ Print::ApplyStatus Print::apply(const Model &model, const DynamicPrintConfig &co
                         last_z = range.first.second;
                     }
                 }
-            }
             if (m_ranges.empty())
                 m_ranges.emplace_back(t_layer_height_range(0, DBL_MAX), nullptr);
             else if (m_ranges.back().second == nullptr)
@@ -711,7 +787,6 @@ Print::ApplyStatus Print::apply(const Model &model, const DynamicPrintConfig &co
         print_object_status.emplace(PrintObjectStatus(print_object));
 
     // 3) Synchronize ModelObjects & PrintObjects.
-    size_t num_extruders = m_config.nozzle_diameter.size();
     for (size_t idx_model_object = 0; idx_model_object < model.objects.size(); ++ idx_model_object) {
         ModelObject &model_object = *m_model.objects[idx_model_object];
         auto it_status = model_object_status.find(ModelObjectStatus(model_object.id()));
@@ -758,7 +833,7 @@ Print::ApplyStatus Print::apply(const Model &model, const DynamicPrintConfig &co
             bool object_config_changed = model_object.config != model_object_new.config;
 			if (object_config_changed)
 				static_cast<DynamicPrintConfig&>(model_object.config) = static_cast<const DynamicPrintConfig&>(model_object_new.config);
-            if (! object_diff.empty() || object_config_changed) {
+            if (! object_diff.empty() || object_config_changed || num_extruders_changed) {
                 PrintObjectConfig new_config = PrintObject::object_config_from_model_object(m_default_object_config, model_object, num_extruders);
                 auto range = print_object_status.equal_range(PrintObjectStatus(model_object.id()));
                 for (auto it = range.first; it != range.second; ++ it) {
@@ -1087,25 +1162,41 @@ std::string Print::validate() const
         // #4043
         if (total_copies_count > 1 && ! m_config.complete_objects.value)
             return L("The Spiral Vase option can only be used when printing a single object.");
-        if (m_regions.size() > 1)
+        assert(m_objects.size() == 1);
+        size_t num_regions = 0;
+        for (const std::vector<std::pair<t_layer_height_range, int>> &volumes_per_region : m_objects.front()->region_volumes)
+        	if (! volumes_per_region.empty())
+        		++ num_regions;
+        if (num_regions > 1)
             return L("The Spiral Vase option can only be used when printing single material objects.");
     }
 
     if (this->has_wipe_tower() && ! m_objects.empty()) {
+        // Make sure all extruders use same diameter filament and have the same nozzle diameter
+        // EPSILON comparison is used for nozzles and 10 % tolerance is used for filaments
+        double first_nozzle_diam = m_config.nozzle_diameter.get_at(extruders().front());
+        double first_filament_diam = m_config.filament_diameter.get_at(extruders().front());
+        for (const auto& extruder_idx : extruders()) {
+            double nozzle_diam = m_config.nozzle_diameter.get_at(extruder_idx);
+            double filament_diam = m_config.filament_diameter.get_at(extruder_idx);
+            if (nozzle_diam - EPSILON > first_nozzle_diam || nozzle_diam + EPSILON < first_nozzle_diam
+             || std::abs((filament_diam-first_filament_diam)/first_filament_diam) > 0.1)
+                 return L("The wipe tower is only supported if all extruders have the same nozzle diameter "
+                          "and use filaments of the same diameter.");
+        }
+
         if (m_config.gcode_flavor != gcfRepRap && m_config.gcode_flavor != gcfRepetier && m_config.gcode_flavor != gcfMarlin)
             return L("The Wipe Tower is currently only supported for the Marlin, RepRap/Sprinter and Repetier G-code flavors.");
         if (! m_config.use_relative_e_distances)
             return L("The Wipe Tower is currently only supported with the relative extruder addressing (use_relative_e_distances=1).");
+        if (m_config.ooze_prevention)
+            return L("Ooze prevention is currently not supported with the wipe tower enabled.");
         
-        for (size_t i=1; i<m_config.nozzle_diameter.values.size(); ++i)
-            if (m_config.nozzle_diameter.values[i] != m_config.nozzle_diameter.values[i-1])
-                return L("All extruders must have the same diameter for the Wipe Tower.");
-
         if (m_objects.size() > 1) {
             bool                                has_custom_layering = false;
             std::vector<std::vector<coordf_t>>  layer_height_profiles;
             for (const PrintObject *object : m_objects) {
-                has_custom_layering = ! object->model_object()->layer_config_ranges.empty() || ! object->model_object()->layer_height_profile.empty();      // #ys_FIXME_experiment
+                has_custom_layering = ! object->model_object()->layer_config_ranges.empty() || ! object->model_object()->layer_height_profile.empty();
                 if (has_custom_layering) {
                     layer_height_profiles.assign(m_objects.size(), std::vector<coordf_t>());
                     break;
@@ -1184,6 +1275,20 @@ std::string Print::validate() const
                 return L("One or more object were assigned an extruder that the printer does not have.");
 #endif
 
+		auto validate_extrusion_width = [min_nozzle_diameter, max_nozzle_diameter](const ConfigBase &config, const char *opt_key, double layer_height, std::string &err_msg) -> bool {
+        	double extrusion_width_min = config.get_abs_value(opt_key, min_nozzle_diameter);
+        	double extrusion_width_max = config.get_abs_value(opt_key, max_nozzle_diameter);
+        	if (extrusion_width_min == 0) {
+        		// Default "auto-generated" extrusion width is always valid.
+        	} else if (extrusion_width_min <= layer_height) {
+        		err_msg = (boost::format(L("%1%=%2% mm is too low to be printable at a layer height %3% mm")) % opt_key % extrusion_width_min % layer_height).str();
+				return false;
+			} else if (extrusion_width_max >= max_nozzle_diameter * 3.) {
+				err_msg = (boost::format(L("Excessive %1%=%2% mm to be printable with a nozzle diameter %3% mm")) % opt_key % extrusion_width_max % max_nozzle_diameter).str();
+				return false;
+			}
+			return true;
+		};
         for (PrintObject *object : m_objects) {
             if (object->config().raft_layers > 0 || object->config().support_material.value) {
 				if ((object->config().support_material_extruder == 0 || object->config().support_material_interface_extruder == 0) && max_nozzle_diameter - min_nozzle_diameter > EPSILON) {
@@ -1227,8 +1332,20 @@ std::string Print::validate() const
                 return L("First layer height can't be greater than nozzle diameter");
             
             // validate layer_height
-            if (object->config().layer_height.value > min_nozzle_diameter)
+            double layer_height = object->config().layer_height.value;
+            if (layer_height > min_nozzle_diameter)
                 return L("Layer height can't be greater than nozzle diameter");
+
+            // Validate extrusion widths.
+            std::string err_msg;
+            if (! validate_extrusion_width(object->config(), "extrusion_width", layer_height, err_msg))
+            	return err_msg;
+            if ((object->config().support_material || object->config().raft_layers > 0) && ! validate_extrusion_width(object->config(), "support_material_extrusion_width", layer_height, err_msg))
+            	return err_msg;
+            for (const char *opt_key : { "perimeter_extrusion_width", "external_perimeter_extrusion_width", "infill_extrusion_width", "solid_infill_extrusion_width", "top_infill_extrusion_width" })
+				for (size_t i = 0; i < object->region_volumes.size(); ++ i)
+            		if (! object->region_volumes[i].empty() && ! validate_extrusion_width(this->get_region(i)->config(), opt_key, layer_height, err_msg))
+		            	return err_msg;
         }
     }
 
@@ -1660,7 +1777,7 @@ void Print::_make_wipe_tower()
                     break;
                 lt.has_support = true;
                 // Insert the new support layer.
-                double height    = lt.print_z - m_wipe_tower_data.tool_ordering.layer_tools()[i-1].print_z;
+                double height    = lt.print_z - (i == 0 ? 0. : m_wipe_tower_data.tool_ordering.layer_tools()[i-1].print_z);
                 //FIXME the support layer ID is set to -1, as Vojtech hopes it is not being used anyway.
                 it_layer = m_objects.front()->insert_support_layer(it_layer, -1, height, lt.print_z, lt.print_z - 0.5 * height);
                 ++ it_layer;
@@ -1670,15 +1787,7 @@ void Print::_make_wipe_tower()
     this->throw_if_canceled();
 
     // Initialize the wipe tower.
-    WipeTower wipe_tower(
-        m_config.single_extruder_multi_material.value,
-        float(m_config.wipe_tower_x.value),     float(m_config.wipe_tower_y.value), 
-        float(m_config.wipe_tower_width.value),
-        float(m_config.wipe_tower_rotation_angle.value), float(m_config.cooling_tube_retraction.value),
-        float(m_config.cooling_tube_length.value), float(m_config.parking_pos_retraction.value),
-        float(m_config.extra_loading_move.value), float(m_config.wipe_tower_bridging),
-        m_config.high_current_on_filament_swap.value, m_config.gcode_flavor, wipe_volumes,
-        m_wipe_tower_data.tool_ordering.first_extruder());
+    WipeTower wipe_tower(m_config, wipe_volumes, m_wipe_tower_data.tool_ordering.first_extruder());
 
     //wipe_tower.set_retract();
     //wipe_tower.set_zhop();
@@ -1687,21 +1796,7 @@ void Print::_make_wipe_tower()
     for (size_t i = 0; i < number_of_extruders; ++ i)
 
         wipe_tower.set_extruder(
-            i, 
-            m_config.filament_type.get_at(i),
-            m_config.temperature.get_at(i),
-            m_config.first_layer_temperature.get_at(i),
-			(float)m_config.filament_loading_speed.get_at(i),
-			(float)m_config.filament_loading_speed_start.get_at(i),
-			(float)m_config.filament_unloading_speed.get_at(i),
-			(float)m_config.filament_unloading_speed_start.get_at(i),
-			(float)m_config.filament_toolchange_delay.get_at(i),
-            m_config.filament_cooling_moves.get_at(i),
-			(float)m_config.filament_cooling_initial_speed.get_at(i),
-			(float)m_config.filament_cooling_final_speed.get_at(i),
-            m_config.filament_ramming_parameters.get_at(i),
-            m_config.filament_max_volumetric_speed.get_at(i),
-            m_config.nozzle_diameter.get_at(i));
+            i, m_config);
 
     m_wipe_tower_data.priming = Slic3r::make_unique<std::vector<WipeTower::ToolChangeResult>>(
         wipe_tower.prime((float)this->skirt_first_layer_height(), m_wipe_tower_data.tool_ordering.all_extruders(), false));
@@ -1783,47 +1878,7 @@ std::string Print::output_filename(const std::string &filename_base) const
     DynamicConfig config = this->finished() ? this->print_statistics().config() : this->print_statistics().placeholders();
     return this->PrintBase::output_filename(m_config.output_filename_format.value, ".gcode", filename_base, &config);
 }
-/*
-// Shorten the dhms time by removing the seconds, rounding the dhm to full minutes
-// and removing spaces.
-static std::string short_time(const std::string &time)
-{
-    // Parse the dhms time format.
-    int days    = 0;
-    int hours   = 0;
-    int minutes = 0;
-    int seconds = 0;
-    if (time.find('d') != std::string::npos)
-        ::sscanf(time.c_str(), "%dd %dh %dm %ds", &days, &hours, &minutes, &seconds);
-    else if (time.find('h') != std::string::npos)
-        ::sscanf(time.c_str(), "%dh %dm %ds", &hours, &minutes, &seconds);
-    else if (time.find('m') != std::string::npos)
-        ::sscanf(time.c_str(), "%dm %ds", &minutes, &seconds);
-    else if (time.find('s') != std::string::npos)
-        ::sscanf(time.c_str(), "%ds", &seconds);
-    // Round to full minutes.
-    if (days + hours + minutes > 0 && seconds >= 30) {
-        if (++ minutes == 60) {
-            minutes = 0;
-            if (++ hours == 24) {
-                hours = 0;
-                ++ days;
-            }
-        }
-    }
-    // Format the dhm time.
-    char buffer[64];
-    if (days > 0)
-        ::sprintf(buffer, "%dd%dh%dm", days, hours, minutes);
-    else if (hours > 0)
-        ::sprintf(buffer, "%dh%dm", hours, minutes);
-    else if (minutes > 0)
-        ::sprintf(buffer, "%dm", minutes);
-    else
-        ::sprintf(buffer, "%ds", seconds);
-    return buffer;
-}
-*/
+
 DynamicConfig PrintStatistics::config() const
 {
     DynamicConfig config;
